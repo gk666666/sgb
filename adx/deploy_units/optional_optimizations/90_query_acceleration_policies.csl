@@ -1,0 +1,87 @@
+// ADX performance optimization script
+// Scope: row order + hot cache only
+// Goal: improve recent-window queries and dry-run verification speed without changing business logic
+//
+// Notes:
+// 1. Row order only affects data ingested after the policy is set.
+// 2. Hot cache keeps recent data in faster storage tiers; it doesn't change query results.
+// 3. Start with a conservative hot window. Increase only if recent-query pressure really needs it.
+//
+// 对象说明：
+// - 本文件不创建业务表和函数；
+// - 只给 defect / production 的正式表设置 roworder 和 hot cache；
+// - 用途是提升近实时查询、dry run 验证和发送候选查询性能。
+
+// ----------------------------------------------------------------------
+// Defect tables
+// ----------------------------------------------------------------------
+
+// raw_defect_eh roworder：让缺陷 raw 表优先按 topic + 业务时间聚簇，提升近窗 topic 查询速度。
+.alter table raw_defect_eh policy roworder (topic asc, emqx_ts desc)
+// raw_defect_eh hot cache：把最近 7 天 raw 数据留在热缓存，方便联调和排查最近消息。
+.alter table raw_defect_eh policy caching hot = 7d
+
+// defect_std_all_v2 roworder：优化标准化缺陷表按 source_topic + 生效时间的近窗查询。
+.alter table defect_std_all_v2 policy roworder (source_topic asc, effective_source_time desc)
+// defect_std_all_v2 hot cache：保留最近 7 天正式标准化结果在热缓存。
+.alter table defect_std_all_v2 policy caching hot = 7d
+
+// defect_plc_report_equivalent_v2 roworder：优化正式等价表按 topic + 时间的发送候选和验证查询。
+.alter table defect_plc_report_equivalent_v2 policy roworder (source_topic asc, effective_source_time desc)
+// defect_plc_report_equivalent_v2 hot cache：保留最近 14 天正式等价结果在热缓存。
+.alter table defect_plc_report_equivalent_v2 policy caching hot = 14d
+
+// defect_forward_success roworder：优化按 forward_target 和 ack_time 查最近成功台账。
+.alter table defect_forward_success policy roworder (forward_target asc, ack_time desc)
+// defect_forward_success hot cache：保留最近 14 天成功台账在热缓存，便于候选去重。
+.alter table defect_forward_success policy caching hot = 14d
+
+// defect_forward_audit roworder：优化按 forward_target 和 attempt_time 查最近发送审计记录。
+.alter table defect_forward_audit policy roworder (forward_target asc, attempt_time desc)
+// defect_forward_audit hot cache：保留最近 14 天审计台账在热缓存，便于问题排查。
+.alter table defect_forward_audit policy caching hot = 14d
+
+// ----------------------------------------------------------------------
+// Production output tables
+// ----------------------------------------------------------------------
+
+// prod_output_minute roworder：优化产量分钟表按 topic + 分钟窗口的近窗查询和候选提取。
+.alter table prod_output_minute policy roworder (topic asc, metric_window_start desc)
+// prod_output_minute hot cache：保留最近 7 天分钟结果在热缓存，支撑产量接口验证。
+.alter table prod_output_minute policy caching hot = 7d
+
+// prod_output_hour roworder：优化产量小时表按 topic + 小时窗口的查询。
+.alter table prod_output_hour policy roworder (topic asc, metric_window_start desc)
+// prod_output_hour hot cache：保留最近 14 天小时结果在热缓存。
+.alter table prod_output_hour policy caching hot = 14d
+
+// prod_output_day roworder：优化按 topic + 日期的日产量查询。
+.alter table prod_output_day policy roworder (topic asc, metric_window_start desc)
+// prod_output_day hot cache：保留最近 30 天日产量结果在热缓存。
+.alter table prod_output_day policy caching hot = 30d
+
+// prod_output_month roworder：优化按 topic + 月份的月产量查询。
+.alter table prod_output_month policy roworder (topic asc, metric_window_start desc)
+// prod_output_month hot cache：保留最近 90 天月产量结果在热缓存。
+.alter table prod_output_month policy caching hot = 90d
+
+// prod_tellus_forward_success roworder：优化产量接口成功台账按 target + 时间窗口去重和核查。
+.alter table prod_tellus_forward_success policy roworder (forward_target asc, metric_window_start desc)
+// prod_tellus_forward_success hot cache：保留最近 14 天成功台账在热缓存。
+.alter table prod_tellus_forward_success policy caching hot = 14d
+
+// prod_tellus_forward_audit roworder：优化产量接口审计台账按 target + 尝试时间查询。
+.alter table prod_tellus_forward_audit policy roworder (forward_target asc, attempt_time desc)
+// prod_tellus_forward_audit hot cache：保留最近 14 天审计台账在热缓存。
+.alter table prod_tellus_forward_audit policy caching hot = 14d
+
+// ----------------------------------------------------------------------
+// Verification commands
+// ----------------------------------------------------------------------
+
+// 校验 raw_defect_eh 的 roworder 是否已生效。
+.show table raw_defect_eh policy roworder
+// 校验 defect_plc_report_equivalent_v2 的 roworder 是否已生效。
+.show table defect_plc_report_equivalent_v2 policy roworder
+// 校验 prod_output_minute 的 roworder 是否已生效。
+.show table prod_output_minute policy roworder

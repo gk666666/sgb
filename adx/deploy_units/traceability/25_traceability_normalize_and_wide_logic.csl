@@ -1,0 +1,1133 @@
+// 追溯链路等价层脚本。
+//
+// 作用分三块：
+// 1) 定义 raw_traceability_eh 和各 topic 的 raw/std 解析函数；
+// 2) 把不同追溯事件统一成长表 schema；
+// 3) 基于缺陷 equivalent_v2 做业务键桥接，再拼成“一块玻璃一行”的宽表等价层。
+//
+// 当前正式物理落表在 45_traceability_materialized_tables.csl，
+// 但物化层依赖本文件提供的 normalized event、键桥接和 wide equivalent 结果。
+//
+// Run in database: iotdbsekdb01prd
+//
+// 对象说明：
+// - table raw_traceability_eh：追溯原始入湖表。
+// - function fn_traceability_ws*_raw_v1()：按工位/topic 切 raw 记录。
+// - function fn_traceability_schema_empty_v1()：追溯统一 schema 空表底座。
+// - function fn_traceability_ws*_std_v1()：把各 topic 解析成统一追溯明细。
+// - function fn_traceability_normalized_events_v1()：汇总所有追溯标准事件。
+// - function fn_traceability_enrich_keys_v1(...)：按历史缺陷链补业务键。
+// - function fn_traceability_wide_equivalent_v2()：把追溯事件收敛成宽表等价层。
+
+// raw_traceability_eh：Traceability 链的原始入湖表，存放各工位追溯原始消息。
+// 下游所有 fn_traceability_*_raw_v1 都从这张表按 topic 切分各工位原始数据。
+.create-merge table raw_traceability_eh (
+    enqueued_time: datetime,
+    topic: string,
+    device_name: string,
+    message_id: string,
+    payload: dynamic
+)
+
+// raw_traceability_eh_json：raw_traceability_eh 的 JSON ingestion mapping。
+// Event Hub Data Connection 用这个 mapping 把追溯原始消息落到 raw_traceability_eh。
+.create-or-alter table raw_traceability_eh ingestion json mapping "raw_traceability_eh_json"
+'[
+  {"column":"enqueued_time","path":"$.enqueued_time","datatype":"datetime"},
+  {"column":"topic","path":"$.topic","datatype":"string"},
+  {"column":"device_name","path":"$.device_name","datatype":"string"},
+  {"column":"message_id","path":"$.message_id","datatype":"string"},
+  {"column":"payload","path":"$.payload","datatype":"dynamic"}
+]'
+
+// fn_traceability_ws1_2cw2_raw_v1：筛出 WS1 2CW2 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_2cw2_std_v1 会基于它做统一字段标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 2CW2 traceability raw rows") fn_traceability_ws1_2cw2_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/2CW2"
+}
+
+// fn_traceability_ws1_3fw2_raw_v1：筛出 WS1 3FW2 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_3fw2_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 3FW2 traceability raw rows") fn_traceability_ws1_3fw2_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/3FW2"
+}
+
+// fn_traceability_ws1_4aw2_raw_v1：筛出 WS1 4AW2 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_4aw2_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 4AW2 traceability raw rows") fn_traceability_ws1_4aw2_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/4AW2"
+}
+
+// fn_traceability_ws1_5fn6_final_raw_v1：筛出 WS1 5FN6 Final 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_5fn6_final_std_v1 依赖它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 5FN6 Final traceability raw rows") fn_traceability_ws1_5fn6_final_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/5FN6/Final"
+}
+
+// fn_traceability_ws1_8pa1_eolcv_raw_v1：筛出 WS1 8PA1 EOLCV_A 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_8pa1_eolcv_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 8PA1 EOLCV_A traceability raw rows") fn_traceability_ws1_8pa1_eolcv_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/8PA1/EOLCV_A"
+}
+
+// fn_traceability_ws1_8pa1_milling_raw_v1：筛出 WS1 8PA1 Milling 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_8pa1_milling_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 8PA1 Milling traceability raw rows") fn_traceability_ws1_8pa1_milling_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/8PA1/Milling"
+}
+
+// fn_traceability_ws1_8pa1_defects_b_raw_v1：筛出 WS1 8PA1 Defects_B 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_8pa1_defects_b_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 8PA1 Defects_B traceability raw rows") fn_traceability_ws1_8pa1_defects_b_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/8PA1/Defects_B"
+}
+
+// fn_traceability_ws1_8pa1_packing_raw_v1：筛出 WS1 8PA1 Packing 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_8pa1_packing_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 8PA1 Packing traceability raw rows") fn_traceability_ws1_8pa1_packing_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/8PA1/Packing"
+}
+
+// fn_traceability_ws1_8pa1_curing_raw_v1：筛出 WS1 8PA1 Curing 工位的追溯原始消息。
+// 下游 fn_traceability_ws1_8pa1_curing_std_v1 会结合 Packing 槽位信息做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS1 8PA1 Curing traceability raw rows") fn_traceability_ws1_8pa1_curing_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS1/8PA1/Curing"
+}
+
+// fn_traceability_ws3_prim_raw_v1：筛出 WS3 PRIM 工位的追溯原始消息。
+// 下游 fn_traceability_ws3_prim_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS3 PRIM traceability raw rows") fn_traceability_ws3_prim_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM"
+}
+
+// fn_traceability_ws3_prim_inspec_raw_v1：筛出 WS3 PRIM_INSPEC 工位的追溯原始消息。
+// 下游 fn_traceability_ws3_prim_inspec_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS3 PRIM_INSPEC traceability raw rows") fn_traceability_ws3_prim_inspec_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM_INSPEC"
+}
+
+// fn_traceability_ws3_pu1_raw_v1：筛出 WS3 PU1 工位的追溯原始消息。
+// 下游 fn_traceability_ws3_pu1_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS3 PU1 traceability raw rows") fn_traceability_ws3_pu1_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PU1"
+}
+
+// fn_traceability_ws3_curing_raw_v1：筛出 WS3 Curing 工位的追溯原始消息。
+// 下游 fn_traceability_ws3_curing_std_v1 会读取它做标准化。
+.create-or-alter function with (folder = "traceability/raw", docstring = "WS3 Curing traceability raw rows") fn_traceability_ws3_curing_raw_v1() {
+    raw_traceability_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/Curing"
+}
+
+// fn_traceability_schema_empty_v1：统一 traceability schema 的空骨架函数。
+// 各工位标准化函数会按这套字段结构对齐，便于后续 union 和物化。
+.create-or-alter function with (folder = "traceability/std", docstring = "Normalized traceability schema helper") fn_traceability_schema_empty_v1() {
+    datatable(
+        glass_key:string,
+        event_time:datetime,
+        event_source:string,
+        source_topic:string,
+        source_message_id:string,
+        dmc_code:string,
+        rfid:string,
+        rfid_prefix28:string,
+        aura_code:string,
+        pdlc_code:string,
+        mest_result:string,
+        status:string,
+        lig_code:string,
+        bracket_rfid_code:string,
+        primer_code:string,
+        rack_id:string,
+        slot_id:int,
+        bottle1_code:string,
+        bottle2_code:string,
+        bottle3_code:string,
+        temp:real,
+        humidity:real
+    )[]
+}
+
+// fn_traceability_ws1_2cw2_std_v1：把 WS1 2CW2 原始消息标准化成统一追溯字段。
+// fn_traceability_normalized_events_v1 会把它与其他工位的标准化结果一起合并。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 2CW2 normalized traceability rows") fn_traceability_ws1_2cw2_std_v1() {
+    fn_traceability_ws1_2cw2_raw_v1()
+    | extend p = iff(isnotnull(payload["2cw2"]), todynamic(payload["2cw2"]), payload)
+    | extend
+        dmc_code = trim(@" ", tostring(p.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_2cw2",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_3fw2_std_v1：把 WS1 3FW2 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 3FW2 normalized traceability rows") fn_traceability_ws1_3fw2_std_v1() {
+    fn_traceability_ws1_3fw2_raw_v1()
+    | extend p = iff(isnotnull(payload["3fw2"]), todynamic(payload["3fw2"]), payload)
+    | extend
+        dmc_code = trim(@" ", tostring(p.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_3fw2",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_4aw2_std_v1：把 WS1 4AW2 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 4AW2 normalized traceability rows") fn_traceability_ws1_4aw2_std_v1() {
+    fn_traceability_ws1_4aw2_raw_v1()
+    | extend p = iff(isnotnull(payload["4aw2"]), todynamic(payload["4aw2"]), payload)
+    | extend
+        dmc_code = trim(@" ", tostring(p.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_4aw2",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_5fn6_final_std_v1：把 WS1 5FN6 Final 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 5FN6 Final normalized traceability rows") fn_traceability_ws1_5fn6_final_std_v1() {
+    fn_traceability_ws1_5fn6_final_raw_v1()
+    | extend defects = todynamic(payload.defects)
+    | mv-apply defect = defects on (
+        summarize max_report_time = max(todatetime(tostring(defect.report_time)))
+    )
+    | extend
+        dmc_code = trim(@" ", tostring(payload.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.rfid), tostring(payload.RFID))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(max_report_time, enqueued_time),
+        aura_code = trim(@" ", tostring(payload.aura_code)),
+        pdlc_code = trim(@" ", tostring(payload.pdlc_code)),
+        mest_result = trim(@" ", tostring(payload.mest_result)),
+        status = toupper(trim(@" ", tostring(payload.status)))
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_5fn6_final",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code,
+        pdlc_code,
+        mest_result,
+        status,
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_8pa1_eolcv_std_v1：把 WS1 8PA1 EOLCV_A 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 8PA1 EOLCV_A normalized traceability rows") fn_traceability_ws1_8pa1_eolcv_std_v1() {
+    fn_traceability_ws1_8pa1_eolcv_raw_v1()
+    | extend
+        eol = iff(isnotnull(payload.eol_inspection), todynamic(payload.eol_inspection), dynamic({})),
+        pdlc = iff(isnotnull(payload.pdlc), todynamic(payload.pdlc), dynamic({})),
+        mest = iff(isnotnull(payload.mest), todynamic(payload.mest), dynamic({}))
+    | extend
+        dmc_code = trim(@" ", tostring(payload.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code), tostring(payload.glass_rfid))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(
+            todatetime(tostring(payload.production_time)),
+            todatetime(tostring(payload.time)),
+            todatetime(tostring(payload.timestamp)),
+            todatetime(tostring(eol.inspTime)),
+            enqueued_time
+        ),
+        pdlc_code = trim(@" ", coalesce(tostring(payload.pdlc_code), tostring(payload["PDLC Code"]))),
+        mest_result = trim(@" ", coalesce(tostring(mest.mest_pdlc), tostring(mest.pdlc_ok), tostring(mest.pdlc_ng), tostring(pdlc.mest_result.pdlc))),
+        status = trim(@" ", coalesce(tostring(payload.result), tostring(eol.result))),
+        lig_code = trim(@" ", coalesce(tostring(payload.lig_code), tostring(mest.lig_1), tostring(mest.lig_2), tostring(payload.led_harness_code))),
+        aura_code = ""
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_8pa1_eolcv",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code,
+        pdlc_code,
+        mest_result,
+        status,
+        lig_code,
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_8pa1_milling_std_v1：把 WS1 8PA1 Milling 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 8PA1 Milling normalized traceability rows") fn_traceability_ws1_8pa1_milling_std_v1() {
+    fn_traceability_ws1_8pa1_milling_raw_v1()
+    | extend
+        dmc_code = trim(@" ", tostring(payload.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(
+            todatetime(tostring(payload.time)),
+            todatetime(tostring(payload.timestamp)),
+            todatetime(tostring(payload.entry_time)),
+            todatetime(tostring(payload.milling_endtime)),
+            enqueued_time
+        )
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_8pa1_milling",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = trim(@" ", tostring(payload.pdlc_code)),
+        mest_result = "",
+        status = trim(@" ", tostring(payload.status)),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_8pa1_defects_b_std_v1：把 WS1 8PA1 Defects_B 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 8PA1 Defects_B normalized traceability rows") fn_traceability_ws1_8pa1_defects_b_std_v1() {
+    fn_traceability_ws1_8pa1_defects_b_raw_v1()
+    | extend defects = iff(isnotnull(payload.defects), todynamic(payload.defects), dynamic({}))
+    | extend
+        dmc_code = trim(@" ", tostring(payload.dmc_code)),
+        rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code))),
+        glass_key = coalesce(dmc_code, rfid),
+        event_time = coalesce(todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), enqueued_time),
+        lig_code = trim(@" ", tostring(payload.lig_code)),
+        bracket_rfid_code = trim(@" ", tostring(payload.bracket_rfid_code)),
+        primer_code = trim(@" ", tostring(payload.primer_code)),
+        status = trim(@" ", tostring(payload.status))
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws1_8pa1_defects_b",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_8pa1_packing_std_v1：把 WS1 8PA1 Packing 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 8PA1 Packing normalized traceability rows") fn_traceability_ws1_8pa1_packing_std_v1() {
+    fn_traceability_ws1_8pa1_packing_raw_v1()
+    | extend rack = iff(isnotnull(payload.rack), todynamic(payload.rack), dynamic({}))
+    | extend rack_id = trim(@" ", tostring(payload.rack_id))
+    | extend event_time = coalesce(todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), enqueued_time)
+    | mv-expand slot_id = dynamic([1,2,3,4,5,6,7,8,9,10,11,12]) to typeof(long)
+    | extend slot_glass_id = trim(@" ", tostring(rack[strcat("glass_id", tostring(slot_id))]))
+    | extend rfid = iff(isnotempty(slot_glass_id), substring(slot_glass_id, 0, 28), "")
+    | where isnotempty(rfid)
+    | project
+        glass_key = rfid,
+        event_time,
+        event_source = "ws1_8pa1_packing",
+        source_topic = topic,
+        source_message_id = strcat(message_id, "_", tostring(slot_id)),
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id,
+        slot_id = toint(slot_id),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws1_8pa1_curing_std_v1：把 WS1 8PA1 Curing 原始消息标准化成统一追溯字段。
+// 它会结合 Packing 槽位把 rack 级信息展开到玻璃级记录。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS1 8PA1 Curing normalized traceability rows with rack-to-glass expansion through Packing slots") fn_traceability_ws1_8pa1_curing_std_v1() {
+    let packing =
+        fn_traceability_ws1_8pa1_packing_std_v1()
+        | where isnotempty(rack_id)
+        | project packing_glass_key = glass_key, packing_rfid = rfid, rack_id, packing_time = event_time;
+    fn_traceability_ws1_8pa1_curing_raw_v1()
+    | extend
+        rack_id = trim(@" ", tostring(payload.rack_id)),
+        event_time = coalesce(
+            todatetime(tostring(payload.entry_time)),
+            todatetime(tostring(payload.write_time)),
+            todatetime(tostring(payload.departure_time)),
+            todatetime(tostring(payload.timestamp)),
+            todatetime(tostring(payload.time)),
+            enqueued_time
+        )
+    | where isnotempty(rack_id)
+    | join kind = inner packing on rack_id
+    | where packing_time between (event_time - 72h .. event_time + 12h)
+    | summarize arg_max(packing_time, packing_rfid, topic, payload, event_time, message_id, rack_id) by packing_glass_key
+    | project
+        glass_key = packing_glass_key,
+        event_time,
+        event_source = "ws1_8pa1_curing",
+        source_topic = topic,
+        source_message_id = strcat(message_id, "_", packing_glass_key),
+        dmc_code = "",
+        rfid = packing_rfid,
+        rfid_prefix28 = substring(packing_rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = tostring(payload.write_status),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id,
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = todouble(payload.curing_time),
+        humidity = real(null)
+}
+
+// fn_traceability_ws3_prim_std_v1：把 WS3 PRIM 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS3 PRIM normalized traceability rows") fn_traceability_ws3_prim_std_v1() {
+    fn_traceability_ws3_prim_raw_v1()
+    | extend p = iff(isnotnull(payload.ws3_prim), todynamic(payload.ws3_prim), payload)
+    | extend
+        rfid = trim(@" ", coalesce(tostring(p.rfid_write), tostring(p.rfid_read_write))),
+        glass_key = rfid,
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws3_prim",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = trim(@" ", tostring(p.bottle1_code)),
+        bottle2_code = trim(@" ", tostring(p.bottle2_code)),
+        bottle3_code = trim(@" ", tostring(p.bottle3_code)),
+        temp = todouble(p.temp),
+        humidity = todouble(p.humidity)
+}
+
+// fn_traceability_ws3_prim_inspec_std_v1：把 WS3 PRIM_INSPEC 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS3 PRIM_INSPEC normalized traceability rows") fn_traceability_ws3_prim_inspec_std_v1() {
+    fn_traceability_ws3_prim_inspec_raw_v1()
+    | extend p = iff(isnotnull(payload.ws3_prim_inspec), todynamic(payload.ws3_prim_inspec), payload)
+    | extend
+        rfid = trim(@" ", coalesce(tostring(p.rfid_read_write), tostring(p.rfid_write))),
+        glass_key = rfid,
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws3_prim_inspec",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = real(null),
+        humidity = real(null)
+}
+
+// fn_traceability_ws3_pu1_std_v1：把 WS3 PU1 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS3 PU1 normalized traceability rows") fn_traceability_ws3_pu1_std_v1() {
+    fn_traceability_ws3_pu1_raw_v1()
+    | extend p = iff(isnotnull(payload.ws3_pu1), todynamic(payload.ws3_pu1), payload)
+    | extend
+        rfid = trim(@" ", tostring(p.rfid_write)),
+        glass_key = rfid,
+        event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time)
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws3_pu1",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = "",
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id = "",
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = todouble(p.temp),
+        humidity = todouble(p.humidity)
+}
+
+// fn_traceability_ws3_curing_std_v1：把 WS3 Curing 原始消息标准化成统一追溯字段。
+.create-or-alter function with (folder = "traceability/std", docstring = "WS3 Curing normalized traceability rows") fn_traceability_ws3_curing_std_v1() {
+    fn_traceability_ws3_curing_raw_v1()
+    | extend
+        rfid = trim(@" ", tostring(payload.entry_rfid_read)),
+        glass_key = iff(isnotempty(rfid), substring(rfid, 0, 28), ""),
+        event_time = coalesce(
+            todatetime(tostring(payload.entry_time)),
+            todatetime(tostring(payload.write_time)),
+            todatetime(tostring(payload.departure_time)),
+            todatetime(tostring(payload.timestamp)),
+            todatetime(tostring(payload.time)),
+            enqueued_time
+        ),
+        rack_id = trim(@" ", tostring(payload.rack_id))
+    | where isnotempty(glass_key)
+    | project
+        glass_key,
+        event_time,
+        event_source = "ws3_curing",
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid = glass_key,
+        rfid_prefix28 = substring(glass_key, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        mest_result = "",
+        status = tostring(payload.write_status),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        rack_id,
+        slot_id = int(null),
+        bottle1_code = "",
+        bottle2_code = "",
+        bottle3_code = "",
+        temp = todouble(payload.curing_time),
+        humidity = real(null)
+}
+
+// 把全部追溯 topic 统一成长表标准事件层。
+// 这层保留“事件视角”，适合排障、核对原始解析结果和后续物化历史事件表。
+// fn_traceability_normalized_events_v1：把所有已接入工位的标准化追溯结果合并成统一事件流。
+// 后续物化表 traceability_normalized_events_v2 以及宽表函数都会基于它继续处理。
+.create-or-alter function with (folder = "traceability/std", docstring = "Union of normalized traceability event rows") fn_traceability_normalized_events_v1() {
+    union
+        fn_traceability_ws1_2cw2_std_v1(),
+        fn_traceability_ws1_3fw2_std_v1(),
+        fn_traceability_ws1_4aw2_std_v1(),
+        fn_traceability_ws1_5fn6_final_std_v1(),
+        fn_traceability_ws1_8pa1_eolcv_std_v1(),
+        fn_traceability_ws1_8pa1_milling_std_v1(),
+        fn_traceability_ws1_8pa1_defects_b_std_v1(),
+        fn_traceability_ws1_8pa1_packing_std_v1(),
+        fn_traceability_ws1_8pa1_curing_std_v1(),
+        fn_traceability_ws3_prim_std_v1(),
+        fn_traceability_ws3_prim_inspec_std_v1(),
+        fn_traceability_ws3_pu1_std_v1(),
+        fn_traceability_ws3_curing_std_v1()
+}
+
+// 追溯桥接层：
+// 对只有 RFID、没有 dmc/aura/pdlc 的追溯事件，
+// 从 defect_plc_report_equivalent_v2 中按 rfid_prefix28 + 更早历史时间补业务键。
+// 补完后 canonical_glass_key 优先切到 dmc_code，否则仍用 rfid。
+// fn_traceability_enrich_keys_v1：追溯业务键补齐桥接函数。
+// 它会按 RFID 前 28 位和历史时间顺序，从缺陷等价结果里回填 dmc/aura/pdlc 等业务键。
+.create-or-alter function with (folder = "traceability/bridge", docstring = "Backfill traceability business keys from historical defect equivalent records by RFID prefix 28 and earlier event time") fn_traceability_enrich_keys_v1(T:(row_id:string, event_time:datetime, dmc_code:string, rfid:string, aura_code:string, pdlc_code:string)) {
+    let history =
+        defect_plc_report_equivalent_v2
+        | where isnotempty(rfid_prefix28)
+        | extend history_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+        | project
+            rfid_prefix28,
+            history_time,
+            history_dmc_code = dmc_code,
+            history_aura_code = aura_code,
+            history_pdlc_code = pdlc_code;
+    let base =
+        T
+        | extend base_rfid_prefix28 = iff(isnotempty(rfid), substring(rfid, 0, 28), "")
+        | project
+            row_id,
+            event_time,
+            rfid,
+            base_dmc_code = dmc_code,
+            base_aura_code = aura_code,
+            base_pdlc_code = pdlc_code,
+            base_rfid_prefix28;
+    let filled =
+        base
+        | where isnotempty(base_rfid_prefix28) and (isempty(base_dmc_code) or isempty(base_aura_code) or isempty(base_pdlc_code))
+        | join kind = leftouter (
+            history
+            | project
+                base_rfid_prefix28 = rfid_prefix28,
+                history_time,
+                history_dmc_code,
+                history_aura_code,
+                history_pdlc_code
+        ) on base_rfid_prefix28
+        | where isnull(history_time) or history_time <= event_time
+        | summarize arg_max(history_time, *) by row_id
+        | project
+            row_id,
+            enriched_dmc_code = coalesce(base_dmc_code, history_dmc_code),
+            enriched_aura_code = coalesce(base_aura_code, history_aura_code),
+            enriched_pdlc_code = coalesce(base_pdlc_code, history_pdlc_code);
+    base
+    | join kind = leftouter filled on row_id
+    | project
+        row_id,
+        event_time,
+        rfid,
+        dmc_code = coalesce(enriched_dmc_code, base_dmc_code),
+        aura_code = coalesce(enriched_aura_code, base_aura_code),
+        pdlc_code = coalesce(enriched_pdlc_code, base_pdlc_code),
+        canonical_glass_key = coalesce(coalesce(enriched_dmc_code, base_dmc_code), rfid)
+}
+
+// v2 宽表等价层是追溯主链的核心：
+// 1) 每个来源工位先单独解析并补业务键；
+// 2) 以 canonical_glass_key 作为统一聚合键；
+// 3) 对每个工位取该玻璃最新一条有效记录；
+// 4) 8PA1 Packing 会按槽位拆开，8PA1 Curing 再按 rack_id 回连；
+// 5) 最终拼成一块玻璃一行，尽量对齐老 glass_traceability_wide_table 语义。
+// fn_traceability_wide_equivalent_v2：当前更完整的追溯宽表逻辑视图。
+// 它把标准化事件进一步整理成“一片玻璃一行”的宽表语义，供后续物化和看板查询使用。
+.create-or-alter function with (folder = "traceability/equivalent", docstring = "Wide-table parity layer in ADX: one glass per row with historical key bridge and rack-based 8PA1 curing association") fn_traceability_wide_equivalent_v2() {
+    let ws1_2cw2_src =
+        fn_traceability_ws1_2cw2_raw_v1()
+        | extend p = iff(isnotnull(payload["2cw2"]), todynamic(payload["2cw2"]), payload)
+        | extend
+            row_id = strcat("ws1_2cw2|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(p.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code)))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_2cw2_keys =
+        ws1_2cw2_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_2cw2 =
+        ws1_2cw2_src
+        | join kind = inner ws1_2cw2_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__2cw2__rfid = raw_rfid
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__2cw2__rfid) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__2cw2__time = raw_event_time, ws1__2cw2__rfid;
+    let ws1_3fw2_src =
+        fn_traceability_ws1_3fw2_raw_v1()
+        | extend p = iff(isnotnull(payload["3fw2"]), todynamic(payload["3fw2"]), payload)
+        | extend
+            row_id = strcat("ws1_3fw2|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(p.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code))),
+            ws1__3fw2__mold_number = toint(p.mold_number),
+            ws1__3fw2__mold_type = toint(p.mold_type),
+            ws1__3fw2__mold_temp = toint(p.mold_temp),
+            ws1__3fw2__furnace_ch1_temp = toint(p.furnace_ch1_temp),
+            ws1__3fw2__furnace_ch3_temp = toint(p.furnace_ch3_temp),
+            ws1__3fw2__furnace_ch5_temp = toint(p.furnace_ch5_temp)
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_3fw2_keys =
+        ws1_3fw2_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_3fw2 =
+        ws1_3fw2_src
+        | join kind = inner ws1_3fw2_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__3fw2__rfid = raw_rfid, ws1__3fw2__mold_number, ws1__3fw2__mold_type, ws1__3fw2__mold_temp, ws1__3fw2__furnace_ch1_temp, ws1__3fw2__furnace_ch3_temp, ws1__3fw2__furnace_ch5_temp
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__3fw2__rfid, ws1__3fw2__mold_number, ws1__3fw2__mold_type, ws1__3fw2__mold_temp, ws1__3fw2__furnace_ch1_temp, ws1__3fw2__furnace_ch3_temp, ws1__3fw2__furnace_ch5_temp) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__3fw2__time = raw_event_time, ws1__3fw2__rfid, ws1__3fw2__mold_number, ws1__3fw2__mold_type, ws1__3fw2__mold_temp, ws1__3fw2__furnace_ch1_temp, ws1__3fw2__furnace_ch3_temp, ws1__3fw2__furnace_ch5_temp;
+    let ws1_4aw2_src =
+        fn_traceability_ws1_4aw2_raw_v1()
+        | extend p = iff(isnotnull(payload["4aw2"]), todynamic(payload["4aw2"]), payload)
+        | extend
+            row_id = strcat("ws1_4aw2|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(p.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(p.rfid), tostring(p.rfid_code), tostring(p.glass_rfid), tostring(p.glass_rfid_code)))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_4aw2_keys =
+        ws1_4aw2_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_4aw2 =
+        ws1_4aw2_src
+        | join kind = inner ws1_4aw2_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__4aw2__rfid = raw_rfid
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__4aw2__rfid) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__4aw2__time = raw_event_time, ws1__4aw2__rfid;
+    let ws1_5fn6_src =
+        fn_traceability_ws1_5fn6_final_raw_v1()
+        | extend defects = todynamic(payload.defects)
+        | mv-apply defect = defects on (summarize max_report_time = max(todatetime(tostring(defect.report_time))))
+        | extend
+            row_id = strcat("ws1_5fn6_final|", message_id),
+            raw_event_time = coalesce(max_report_time, enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(payload.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.rfid), tostring(payload.RFID))),
+            raw_aura_code = trim(@" ", tostring(payload.aura_code)),
+            raw_pdlc_code = trim(@" ", tostring(payload.pdlc_code)),
+            raw_mest_result = trim(@" ", tostring(payload.mest_result)),
+            raw_status = toupper(trim(@" ", tostring(payload.status)))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_5fn6_keys =
+        ws1_5fn6_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = raw_aura_code, pdlc_code = raw_pdlc_code
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_5fn6 =
+        ws1_5fn6_src
+        | join kind = inner ws1_5fn6_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, raw_mest_result, raw_status, ws1__5fn6__final__rfid = raw_rfid
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, raw_mest_result, raw_status, ws1__5fn6__final__rfid) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, mest_result = raw_mest_result, status = raw_status, ws1__5fn6__final__time = raw_event_time, ws1__5fn6__final__rfid;
+    let ws3_prim_src =
+        fn_traceability_ws3_prim_raw_v1()
+        | extend p = iff(isnotnull(payload.ws3_prim), todynamic(payload.ws3_prim), payload)
+        | extend
+            row_id = strcat("ws3_prim|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_rfid = trim(@" ", coalesce(tostring(p.rfid_write), tostring(p.rfid_read_write))),
+            ws3__prim__bottle1_code = trim(@" ", tostring(p.bottle1_code)),
+            ws3__prim__bottle2_code = trim(@" ", tostring(p.bottle2_code)),
+            ws3__prim__bottle3_code = trim(@" ", tostring(p.bottle3_code)),
+            ws3__prim__temp = todouble(p.temp),
+            ws3__prim__humidity = todouble(p.humidity),
+            ws3__prim__inspec_rfid_write = trim(@" ", tostring(p.inspec_rfid_write))
+        | where isnotempty(raw_rfid);
+    let ws3_prim_keys =
+        ws3_prim_src
+        | project row_id, event_time = raw_event_time, dmc_code = "", rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws3_prim =
+        ws3_prim_src
+        | join kind = inner ws3_prim_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__prim__rfid = raw_rfid, ws3__prim__bottle1_code, ws3__prim__bottle2_code, ws3__prim__bottle3_code, ws3__prim__temp, ws3__prim__humidity, ws3__prim__inspec_rfid_write
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__prim__rfid, ws3__prim__bottle1_code, ws3__prim__bottle2_code, ws3__prim__bottle3_code, ws3__prim__temp, ws3__prim__humidity, ws3__prim__inspec_rfid_write) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws3__prim__time = raw_event_time, ws3__prim__rfid, ws3__prim__bottle1_code, ws3__prim__bottle2_code, ws3__prim__bottle3_code, ws3__prim__temp, ws3__prim__humidity, ws3__prim__inspec_rfid_write;
+    let ws3_prim_inspec_src =
+        fn_traceability_ws3_prim_inspec_raw_v1()
+        | extend p = iff(isnotnull(payload.ws3_prim_inspec), todynamic(payload.ws3_prim_inspec), payload)
+        | extend
+            row_id = strcat("ws3_prim_inspec|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_rfid = trim(@" ", coalesce(tostring(p.rfid_read_write), tostring(p.rfid_write)))
+        | where isnotempty(raw_rfid);
+    let ws3_prim_inspec_keys =
+        ws3_prim_inspec_src
+        | project row_id, event_time = raw_event_time, dmc_code = "", rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws3_prim_inspec =
+        ws3_prim_inspec_src
+        | join kind = inner ws3_prim_inspec_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__prim_inspec__rfid = raw_rfid
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__prim_inspec__rfid) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws3__prim_inspec__time = raw_event_time, ws3__prim_inspec__rfid;
+    let ws3_pu1_src =
+        fn_traceability_ws3_pu1_raw_v1()
+        | extend p = iff(isnotnull(payload.ws3_pu1), todynamic(payload.ws3_pu1), payload)
+        | extend
+            row_id = strcat("ws3_pu1|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(p.time)), todatetime(tostring(p.timestamp)), enqueued_time),
+            raw_rfid = trim(@" ", tostring(p.rfid_write)),
+            ws3__pu1__temp = todouble(p.temp),
+            ws3__pu1__humidity = todouble(p.humidity),
+            ws3__pu1__mold_up_zone01 = toint(p.mold_up_zone01),
+            ws3__pu1__mold_up_zone02 = toint(p.mold_up_zone02),
+            ws3__pu1__mold_down_zone01 = toint(p.mold_down_zone01),
+            ws3__pu1__mold_down_zone02 = toint(p.mold_down_zone02)
+        | where isnotempty(raw_rfid);
+    let ws3_pu1_keys =
+        ws3_pu1_src
+        | project row_id, event_time = raw_event_time, dmc_code = "", rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws3_pu1 =
+        ws3_pu1_src
+        | join kind = inner ws3_pu1_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__pu1__rfid = raw_rfid, ws3__pu1__temp, ws3__pu1__humidity, ws3__pu1__mold_up_zone01, ws3__pu1__mold_up_zone02, ws3__pu1__mold_down_zone01, ws3__pu1__mold_down_zone02
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__pu1__rfid, ws3__pu1__temp, ws3__pu1__humidity, ws3__pu1__mold_up_zone01, ws3__pu1__mold_up_zone02, ws3__pu1__mold_down_zone01, ws3__pu1__mold_down_zone02) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws3__pu1__time = raw_event_time, ws3__pu1__rfid, ws3__pu1__temp, ws3__pu1__humidity, ws3__pu1__mold_up_zone01, ws3__pu1__mold_up_zone02, ws3__pu1__mold_down_zone01, ws3__pu1__mold_down_zone02;
+    let ws3_curing_src =
+        fn_traceability_ws3_curing_raw_v1()
+        | extend
+            raw_rfid_full = trim(@" ", tostring(payload.entry_rfid_read)),
+            raw_rfid = iff(isnotempty(raw_rfid_full), substring(raw_rfid_full, 0, 28), ""),
+            row_id = strcat("ws3_curing|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(payload.entry_time)), todatetime(tostring(payload.write_time)), todatetime(tostring(payload.departure_time)), todatetime(tostring(payload.timestamp)), todatetime(tostring(payload.time)), enqueued_time),
+            ws3__curing__rack_id = trim(@" ", tostring(payload.rack_id)),
+            ws3__curing__entry_time = todatetime(tostring(payload.entry_time)),
+            ws3__curing__entry_rfid_read = raw_rfid_full,
+            ws3__curing__curing_time = todouble(payload.curing_time),
+            ws3__curing__is_departed = toint(payload.is_departed),
+            ws3__curing__departure_time = todatetime(tostring(payload.departure_time)),
+            ws3__curing__departure_rfid_write = trim(@" ", tostring(payload.departure_rfid_write)),
+            ws3__curing__write_status = toint(payload.write_status),
+            ws3__curing__write_time = todatetime(tostring(payload.write_time))
+        | where isnotempty(raw_rfid);
+    let ws3_curing_keys =
+        ws3_curing_src
+        | project row_id, event_time = raw_event_time, dmc_code = "", rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws3_curing =
+        ws3_curing_src
+        | join kind = inner ws3_curing_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__curing__rack_id, ws3__curing__entry_time, ws3__curing__entry_rfid_read, ws3__curing__curing_time, ws3__curing__is_departed, ws3__curing__departure_time, ws3__curing__departure_rfid_write, ws3__curing__write_status, ws3__curing__write_time
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws3__curing__rack_id, ws3__curing__entry_time, ws3__curing__entry_rfid_read, ws3__curing__curing_time, ws3__curing__is_departed, ws3__curing__departure_time, ws3__curing__departure_rfid_write, ws3__curing__write_status, ws3__curing__write_time) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws3__curing__time = raw_event_time, ws3__curing__rack_id, ws3__curing__entry_time, ws3__curing__entry_rfid_read, ws3__curing__curing_time, ws3__curing__is_departed, ws3__curing__departure_time, ws3__curing__departure_rfid_write, ws3__curing__write_status, ws3__curing__write_time;
+    let ws1_8pa1_milling_src =
+        fn_traceability_ws1_8pa1_milling_raw_v1()
+        | extend
+            row_id = strcat("ws1_8pa1_milling|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), todatetime(tostring(payload.entry_time)), todatetime(tostring(payload.milling_endtime)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(payload.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code))),
+            raw_pdlc_code = trim(@" ", tostring(payload.pdlc_code)),
+            raw_status = trim(@" ", tostring(payload.status)),
+            ws1__8pa1__milling__manual_upload = toint(payload.manual_upload),
+            ws1__8pa1__milling__destination = trim(@" ", tostring(payload.destination))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_8pa1_milling_keys =
+        ws1_8pa1_milling_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = raw_pdlc_code
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_8pa1_milling =
+        ws1_8pa1_milling_src
+        | join kind = inner ws1_8pa1_milling_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, raw_status, ws1__8pa1__milling__rfid = raw_rfid, ws1__8pa1__milling__manual_upload, ws1__8pa1__milling__destination
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, raw_status, ws1__8pa1__milling__rfid, ws1__8pa1__milling__manual_upload, ws1__8pa1__milling__destination) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, status = raw_status, ws1__8pa1__milling__time = raw_event_time, ws1__8pa1__milling__rfid, ws1__8pa1__milling__manual_upload, ws1__8pa1__milling__destination;
+    let ws1_8pa1_eolcv_src =
+        fn_traceability_ws1_8pa1_eolcv_raw_v1()
+        | extend
+            eol = iff(isnotnull(payload.eol_inspection), todynamic(payload.eol_inspection), dynamic({})),
+            mest = iff(isnotnull(payload.mest), todynamic(payload.mest), dynamic({})),
+            front_sky_holder = iff(isnotnull(payload.front_sky_holder), todynamic(payload.front_sky_holder), dynamic({})),
+            ecu = iff(isnotnull(payload.ecu), todynamic(payload.ecu), dynamic({})),
+            led_harness = iff(isnotnull(payload.led_harness), todynamic(payload.led_harness), dynamic({})),
+            lig = iff(isnotnull(payload.lig), todynamic(payload.lig), dynamic({})),
+            pdlc = iff(isnotnull(payload.pdlc), todynamic(payload.pdlc), dynamic({})),
+            llp_primer_glass = iff(isnotnull(payload.llp_primer_glass), todynamic(payload.llp_primer_glass), dynamic({})),
+            llp_primer_pu = iff(isnotnull(payload.llp_primer_pu), todynamic(payload.llp_primer_pu), dynamic({})),
+            llp_rework = iff(isnotnull(payload.llp_rework), todynamic(payload.llp_rework), dynamic({}))
+        | extend
+            row_id = strcat("ws1_8pa1_eolcv|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(payload.production_time)), todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), todatetime(tostring(eol.inspTime)), todatetime(tostring(front_sky_holder.time)), todatetime(tostring(ecu.time)), todatetime(tostring(led_harness.time)), todatetime(tostring(lig.time)), todatetime(tostring(pdlc.time)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(payload.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code), tostring(payload.glass_rfid))),
+            raw_pdlc_code = trim(@" ", coalesce(tostring(payload.pdlc_code), tostring(payload["PDLC Code"]))),
+            ws1__8pa1__eolcv__mest_pdlc = trim(@" ", coalesce(tostring(mest.mest_pdlc), tostring(mest.pdlc_ok), tostring(mest.pdlc_ng), tostring(pdlc.mest_result.pdlc))),
+            ws1__8pa1__eolcv__result = trim(@" ", coalesce(tostring(payload.result), tostring(eol.result))),
+            ws1__8pa1__eolcv__lig_1 = trim(@" ", coalesce(tostring(mest.lig_1), tostring(mest.lig1), tostring(pdlc.mest_result.lig1))),
+            ws1__8pa1__eolcv__lig_2 = trim(@" ", coalesce(tostring(mest.lig_2), tostring(mest.lig2), tostring(pdlc.mest_result.lig2))),
+            ws1__8pa1__eolcv__front_sky_holder__time = todatetime(tostring(front_sky_holder.time)),
+            ws1__8pa1__eolcv__front_sky_holder__part1_status = trim(@" ", tostring(front_sky_holder.part1_status)),
+            ws1__8pa1__eolcv__front_sky_holder__part2_status = trim(@" ", tostring(front_sky_holder.part2_status)),
+            ws1__8pa1__eolcv__front_sky_holder__part3_status = trim(@" ", tostring(front_sky_holder.part3_status)),
+            ws1__8pa1__eolcv__front_sky_holder__push2_status = trim(@" ", tostring(front_sky_holder.push2_status)),
+            ws1__8pa1__eolcv__ecu__time = todatetime(tostring(ecu.time)),
+            ws1__8pa1__eolcv__ecu__a02prussure_status = trim(@" ", tostring(ecu.a02prussure_status)),
+            ws1__8pa1__eolcv__led_harness__time = todatetime(tostring(led_harness.time)),
+            ws1__8pa1__eolcv__led_harness__qr_code = trim(@" ", tostring(led_harness.qr_code)),
+            ws1__8pa1__eolcv__led_harness__status = trim(@" ", tostring(led_harness.status)),
+            ws1__8pa1__eolcv__pdlc__time = todatetime(tostring(pdlc.time)),
+            ws1__8pa1__eolcv__lig__time = todatetime(tostring(lig.time)),
+            ws1__8pa1__eolcv__llp_primer_glass__end_time = trim(@" ", tostring(llp_primer_glass.endTime)),
+            ws1__8pa1__eolcv__llp_primer_glass__bottle1_code = trim(@" ", tostring(llp_primer_glass.bottle1_code)),
+            ws1__8pa1__eolcv__llp_primer_glass__bottle2_code = trim(@" ", tostring(llp_primer_glass.bottle2_code)),
+            ws1__8pa1__eolcv__llp_primer_glass__bottle3_code = trim(@" ", tostring(llp_primer_glass.bottle3_code)),
+            ws1__8pa1__eolcv__llp_primer_glass__bottle4_code = trim(@" ", tostring(llp_primer_glass.bottle4_code)),
+            ws1__8pa1__eolcv__llp_primer_glass__bottle5_code = trim(@" ", tostring(llp_primer_glass.bottle5_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__end_time = trim(@" ", tostring(llp_primer_pu.endTime)),
+            ws1__8pa1__eolcv__llp_primer_pu__scan_code = trim(@" ", tostring(llp_primer_pu.scan_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__bottle1_code = trim(@" ", tostring(llp_primer_pu.bottle1_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__bottle2_code = trim(@" ", tostring(llp_primer_pu.bottle2_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__bottle3_code = trim(@" ", tostring(llp_primer_pu.bottle3_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__bottle4_code = trim(@" ", tostring(llp_primer_pu.bottle4_code)),
+            ws1__8pa1__eolcv__llp_primer_pu__bottle5_code = trim(@" ", tostring(llp_primer_pu.bottle5_code)),
+            ws1__8pa1__eolcv__eol_inspection__insp_time = todatetime(tostring(eol.inspTime)),
+            ws1__8pa1__eolcv__llp_rework__end_time = trim(@" ", tostring(llp_rework.endTime)),
+            ws1__8pa1__eolcv__llp_rework__scan_code = trim(@" ", tostring(llp_rework.scan_code)),
+            ws1__8pa1__eolcv__llp_rework__bottle1_code = trim(@" ", tostring(llp_rework.bottle1_code)),
+            ws1__8pa1__eolcv__llp_rework__bottle2_code = trim(@" ", tostring(llp_rework.bottle2_code)),
+            ws1__8pa1__eolcv__llp_rework__bottle3_code = trim(@" ", tostring(llp_rework.bottle3_code)),
+            ws1__8pa1__eolcv__llp_rework__bottle4_code = trim(@" ", tostring(llp_rework.bottle4_code)),
+            ws1__8pa1__eolcv__llp_rework__bottle5_code = trim(@" ", tostring(llp_rework.bottle5_code))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_8pa1_eolcv_keys =
+        ws1_8pa1_eolcv_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = raw_pdlc_code
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_8pa1_eolcv =
+        ws1_8pa1_eolcv_src
+        | join kind = inner ws1_8pa1_eolcv_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__eolcv__rfid = raw_rfid, ws1__8pa1__eolcv__mest_pdlc, ws1__8pa1__eolcv__lig_1, ws1__8pa1__eolcv__lig_2, ws1__8pa1__eolcv__result, ws1__8pa1__eolcv__front_sky_holder__time, ws1__8pa1__eolcv__front_sky_holder__part1_status, ws1__8pa1__eolcv__front_sky_holder__part2_status, ws1__8pa1__eolcv__front_sky_holder__part3_status, ws1__8pa1__eolcv__front_sky_holder__push2_status, ws1__8pa1__eolcv__ecu__time, ws1__8pa1__eolcv__ecu__a02prussure_status, ws1__8pa1__eolcv__led_harness__time, ws1__8pa1__eolcv__led_harness__qr_code, ws1__8pa1__eolcv__led_harness__status, ws1__8pa1__eolcv__pdlc__time, ws1__8pa1__eolcv__lig__time, ws1__8pa1__eolcv__llp_primer_glass__end_time, ws1__8pa1__eolcv__llp_primer_glass__bottle1_code, ws1__8pa1__eolcv__llp_primer_glass__bottle2_code, ws1__8pa1__eolcv__llp_primer_glass__bottle3_code, ws1__8pa1__eolcv__llp_primer_glass__bottle4_code, ws1__8pa1__eolcv__llp_primer_glass__bottle5_code, ws1__8pa1__eolcv__llp_primer_pu__end_time, ws1__8pa1__eolcv__llp_primer_pu__scan_code, ws1__8pa1__eolcv__llp_primer_pu__bottle1_code, ws1__8pa1__eolcv__llp_primer_pu__bottle2_code, ws1__8pa1__eolcv__llp_primer_pu__bottle3_code, ws1__8pa1__eolcv__llp_primer_pu__bottle4_code, ws1__8pa1__eolcv__llp_primer_pu__bottle5_code, ws1__8pa1__eolcv__eol_inspection__insp_time, ws1__8pa1__eolcv__llp_rework__end_time, ws1__8pa1__eolcv__llp_rework__scan_code, ws1__8pa1__eolcv__llp_rework__bottle1_code, ws1__8pa1__eolcv__llp_rework__bottle2_code, ws1__8pa1__eolcv__llp_rework__bottle3_code, ws1__8pa1__eolcv__llp_rework__bottle4_code, ws1__8pa1__eolcv__llp_rework__bottle5_code
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__eolcv__rfid, ws1__8pa1__eolcv__mest_pdlc, ws1__8pa1__eolcv__lig_1, ws1__8pa1__eolcv__lig_2, ws1__8pa1__eolcv__result, ws1__8pa1__eolcv__front_sky_holder__time, ws1__8pa1__eolcv__front_sky_holder__part1_status, ws1__8pa1__eolcv__front_sky_holder__part2_status, ws1__8pa1__eolcv__front_sky_holder__part3_status, ws1__8pa1__eolcv__front_sky_holder__push2_status, ws1__8pa1__eolcv__ecu__time, ws1__8pa1__eolcv__ecu__a02prussure_status, ws1__8pa1__eolcv__led_harness__time, ws1__8pa1__eolcv__led_harness__qr_code, ws1__8pa1__eolcv__led_harness__status, ws1__8pa1__eolcv__pdlc__time, ws1__8pa1__eolcv__lig__time, ws1__8pa1__eolcv__llp_primer_glass__end_time, ws1__8pa1__eolcv__llp_primer_glass__bottle1_code, ws1__8pa1__eolcv__llp_primer_glass__bottle2_code, ws1__8pa1__eolcv__llp_primer_glass__bottle3_code, ws1__8pa1__eolcv__llp_primer_glass__bottle4_code, ws1__8pa1__eolcv__llp_primer_glass__bottle5_code, ws1__8pa1__eolcv__llp_primer_pu__end_time, ws1__8pa1__eolcv__llp_primer_pu__scan_code, ws1__8pa1__eolcv__llp_primer_pu__bottle1_code, ws1__8pa1__eolcv__llp_primer_pu__bottle2_code, ws1__8pa1__eolcv__llp_primer_pu__bottle3_code, ws1__8pa1__eolcv__llp_primer_pu__bottle4_code, ws1__8pa1__eolcv__llp_primer_pu__bottle5_code, ws1__8pa1__eolcv__eol_inspection__insp_time, ws1__8pa1__eolcv__llp_rework__end_time, ws1__8pa1__eolcv__llp_rework__scan_code, ws1__8pa1__eolcv__llp_rework__bottle1_code, ws1__8pa1__eolcv__llp_rework__bottle2_code, ws1__8pa1__eolcv__llp_rework__bottle3_code, ws1__8pa1__eolcv__llp_rework__bottle4_code, ws1__8pa1__eolcv__llp_rework__bottle5_code) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__eolcv__time = raw_event_time, ws1__8pa1__eolcv__rfid, ws1__8pa1__eolcv__mest_pdlc, ws1__8pa1__eolcv__lig_1, ws1__8pa1__eolcv__lig_2, ws1__8pa1__eolcv__result, ws1__8pa1__eolcv__front_sky_holder__time, ws1__8pa1__eolcv__front_sky_holder__part1_status, ws1__8pa1__eolcv__front_sky_holder__part2_status, ws1__8pa1__eolcv__front_sky_holder__part3_status, ws1__8pa1__eolcv__front_sky_holder__push2_status, ws1__8pa1__eolcv__ecu__time, ws1__8pa1__eolcv__ecu__a02prussure_status, ws1__8pa1__eolcv__led_harness__time, ws1__8pa1__eolcv__led_harness__qr_code, ws1__8pa1__eolcv__led_harness__status, ws1__8pa1__eolcv__pdlc__time, ws1__8pa1__eolcv__lig__time, ws1__8pa1__eolcv__llp_primer_glass__end_time, ws1__8pa1__eolcv__llp_primer_glass__bottle1_code, ws1__8pa1__eolcv__llp_primer_glass__bottle2_code, ws1__8pa1__eolcv__llp_primer_glass__bottle3_code, ws1__8pa1__eolcv__llp_primer_glass__bottle4_code, ws1__8pa1__eolcv__llp_primer_glass__bottle5_code, ws1__8pa1__eolcv__llp_primer_pu__end_time, ws1__8pa1__eolcv__llp_primer_pu__scan_code, ws1__8pa1__eolcv__llp_primer_pu__bottle1_code, ws1__8pa1__eolcv__llp_primer_pu__bottle2_code, ws1__8pa1__eolcv__llp_primer_pu__bottle3_code, ws1__8pa1__eolcv__llp_primer_pu__bottle4_code, ws1__8pa1__eolcv__llp_primer_pu__bottle5_code, ws1__8pa1__eolcv__eol_inspection__insp_time, ws1__8pa1__eolcv__llp_rework__end_time, ws1__8pa1__eolcv__llp_rework__scan_code, ws1__8pa1__eolcv__llp_rework__bottle1_code, ws1__8pa1__eolcv__llp_rework__bottle2_code, ws1__8pa1__eolcv__llp_rework__bottle3_code, ws1__8pa1__eolcv__llp_rework__bottle4_code, ws1__8pa1__eolcv__llp_rework__bottle5_code;
+    let ws1_8pa1_defects_b_src =
+        fn_traceability_ws1_8pa1_defects_b_raw_v1()
+        | extend
+            defects = iff(isnotnull(payload.defects), todynamic(payload.defects), dynamic({})),
+            marposs = iff(isnotnull(payload.marposs), todynamic(payload.marposs), dynamic({})),
+            llp_label = iff(isnotnull(payload.llp_label), todynamic(payload.llp_label), dynamic({})),
+            unload_pack = iff(isnotnull(payload.unload_pack), todynamic(payload.unload_pack), dynamic({}))
+        | extend
+            row_id = strcat("ws1_8pa1_defects_b|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), enqueued_time),
+            raw_dmc_code = trim(@" ", tostring(payload.dmc_code)),
+            raw_rfid = trim(@" ", coalesce(tostring(payload.rfid), tostring(payload.rfid_code))),
+            ws1__8pa1__defects_b__primer_code = trim(@" ", tostring(payload.primer_code)),
+            raw_status = trim(@" ", tostring(payload.status)),
+            ws1__8pa1__defects_b__defects__check_time = todatetime(tostring(defects.check_time)),
+            ws1__8pa1__defects_b__defects__rework_code = trim(@" ", tostring(defects.rework_code)),
+            ws1__8pa1__defects_b__marposs__time = todatetime(tostring(marposs.time)),
+            ws1__8pa1__defects_b__marposs__status = trim(@" ", tostring(marposs.status)),
+            ws1__8pa1__defects_b__llp_label__time = todatetime(tostring(llp_label.time)),
+            ws1__8pa1__defects_b__llp_label__code = trim(@" ", tostring(llp_label.code)),
+            ws1__8pa1__defects_b__unload_pack__time = todatetime(tostring(unload_pack.time)),
+            ws1__8pa1__defects_b__unload_pack__status = trim(@" ", tostring(unload_pack.status))
+        | where isnotempty(coalesce(raw_dmc_code, raw_rfid));
+    let ws1_8pa1_defects_b_keys =
+        ws1_8pa1_defects_b_src
+        | project row_id, event_time = raw_event_time, dmc_code = raw_dmc_code, rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_8pa1_defects_b =
+        ws1_8pa1_defects_b_src
+        | join kind = inner ws1_8pa1_defects_b_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__defects_b__rfid = raw_rfid, ws1__8pa1__defects_b__primer_code, raw_status, ws1__8pa1__defects_b__defects__check_time, ws1__8pa1__defects_b__defects__rework_code, ws1__8pa1__defects_b__marposs__time, ws1__8pa1__defects_b__marposs__status, ws1__8pa1__defects_b__llp_label__time, ws1__8pa1__defects_b__llp_label__code, ws1__8pa1__defects_b__unload_pack__time, ws1__8pa1__defects_b__unload_pack__status
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__defects_b__rfid, ws1__8pa1__defects_b__primer_code, raw_status, ws1__8pa1__defects_b__defects__check_time, ws1__8pa1__defects_b__defects__rework_code, ws1__8pa1__defects_b__marposs__time, ws1__8pa1__defects_b__marposs__status, ws1__8pa1__defects_b__llp_label__time, ws1__8pa1__defects_b__llp_label__code, ws1__8pa1__defects_b__unload_pack__time, ws1__8pa1__defects_b__unload_pack__status) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__defects_b__time = raw_event_time, ws1__8pa1__defects_b__rfid, ws1__8pa1__defects_b__primer_code, ws1__8pa1__defects_b__status = raw_status, ws1__8pa1__defects_b__defects__check_time, ws1__8pa1__defects_b__defects__rework_code, ws1__8pa1__defects_b__marposs__time, ws1__8pa1__defects_b__marposs__status, ws1__8pa1__defects_b__llp_label__time, ws1__8pa1__defects_b__llp_label__code, ws1__8pa1__defects_b__unload_pack__time, ws1__8pa1__defects_b__unload_pack__status;
+    let ws1_8pa1_packing_src =
+        fn_traceability_ws1_8pa1_packing_raw_v1()
+        | extend rack = iff(isnotnull(payload.rack), todynamic(payload.rack), dynamic({}))
+        | extend
+            raw_event_time = coalesce(todatetime(tostring(payload.time)), todatetime(tostring(payload.timestamp)), enqueued_time),
+            raw_rack_id = trim(@" ", tostring(payload.rack_id))
+        | mv-expand slot_id = dynamic([1,2,3,4,5,6,7,8,9,10,11,12]) to typeof(long)
+        | extend slot_glass_id = trim(@" ", tostring(rack[strcat("glass_id", tostring(slot_id))]))
+        | extend raw_rfid = iff(isnotempty(slot_glass_id), substring(slot_glass_id, 0, 28), "")
+        | where isnotempty(raw_rfid)
+        | extend row_id = strcat("ws1_8pa1_packing|", message_id, "|", tostring(slot_id));
+    let ws1_8pa1_packing_keys =
+        ws1_8pa1_packing_src
+        | project row_id, event_time = raw_event_time, dmc_code = "", rfid = raw_rfid, aura_code = "", pdlc_code = ""
+        | invoke fn_traceability_enrich_keys_v1();
+    let ws1_8pa1_packing =
+        ws1_8pa1_packing_src
+        | join kind = inner ws1_8pa1_packing_keys on row_id
+        | project canonical_glass_key, raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__packing__rack_id = raw_rack_id, ws1__8pa1__packing__slot_id = toint(slot_id)
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__packing__rack_id, ws1__8pa1__packing__slot_id) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__packing__time = raw_event_time, ws1__8pa1__packing__rack_id, ws1__8pa1__packing__slot_id;
+    let ws1_8pa1_curing_raw =
+        fn_traceability_ws1_8pa1_curing_raw_v1()
+        | extend
+            curing_row_id = strcat("ws1_8pa1_curing|", message_id),
+            raw_event_time = coalesce(todatetime(tostring(payload.entry_time)), todatetime(tostring(payload.write_time)), todatetime(tostring(payload.departure_time)), todatetime(tostring(payload.timestamp)), todatetime(tostring(payload.time)), enqueued_time),
+            raw_rack_id = trim(@" ", tostring(payload.rack_id)),
+            ws1__8pa1__curing__entry_time = todatetime(tostring(payload.entry_time)),
+            ws1__8pa1__curing__curing_time = todouble(payload.curing_time),
+            ws1__8pa1__curing__is_departed = toint(payload.is_departed),
+            ws1__8pa1__curing__departure_time = todatetime(tostring(payload.departure_time)),
+            ws1__8pa1__curing__departure_rfid_write = trim(@" ", tostring(payload.departure_rfid_write)),
+            ws1__8pa1__curing__write_status = toint(payload.write_status),
+            ws1__8pa1__curing__write_time = todatetime(tostring(payload.write_time))
+        | where isnotempty(raw_rack_id);
+    let ws1_8pa1_curing =
+        ws1_8pa1_curing_raw
+        | join kind = inner (
+            ws1_8pa1_packing
+            | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, packing_rack_id = ws1__8pa1__packing__rack_id, packing_time = ws1__8pa1__packing__time
+        ) on $left.raw_rack_id == $right.packing_rack_id
+        | where packing_time between (raw_event_time - 72h .. raw_event_time + 12h)
+        | summarize arg_max(packing_time, dmc_code, rfid, aura_code, pdlc_code, raw_event_time, raw_rack_id, ws1__8pa1__curing__entry_time, ws1__8pa1__curing__curing_time, ws1__8pa1__curing__is_departed, ws1__8pa1__curing__departure_time, ws1__8pa1__curing__departure_rfid_write, ws1__8pa1__curing__write_status, ws1__8pa1__curing__write_time) by canonical_glass_key, curing_row_id
+        | summarize arg_max(raw_event_time, dmc_code, rfid, aura_code, pdlc_code, raw_rack_id, ws1__8pa1__curing__entry_time, ws1__8pa1__curing__curing_time, ws1__8pa1__curing__is_departed, ws1__8pa1__curing__departure_time, ws1__8pa1__curing__departure_rfid_write, ws1__8pa1__curing__write_status, ws1__8pa1__curing__write_time) by canonical_glass_key
+        | project canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, ws1__8pa1__curing__time = raw_event_time, ws1__8pa1__curing__rack_id = raw_rack_id, ws1__8pa1__curing__entry_time, ws1__8pa1__curing__curing_time, ws1__8pa1__curing__is_departed, ws1__8pa1__curing__departure_time, ws1__8pa1__curing__departure_rfid_write, ws1__8pa1__curing__write_status, ws1__8pa1__curing__write_time;
+    let glass_base =
+        union
+            (ws1_2cw2 | project canonical_glass_key, base_time = ws1__2cw2__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws1_3fw2 | project canonical_glass_key, base_time = ws1__3fw2__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws1_4aw2 | project canonical_glass_key, base_time = ws1__4aw2__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws1_5fn6 | project canonical_glass_key, base_time = ws1__5fn6__final__time, dmc_code, rfid, aura_code, pdlc_code, mest_result, status),
+            (ws3_prim | project canonical_glass_key, base_time = ws3__prim__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws3_prim_inspec | project canonical_glass_key, base_time = ws3__prim_inspec__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws3_pu1 | project canonical_glass_key, base_time = ws3__pu1__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws3_curing | project canonical_glass_key, base_time = ws3__curing__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws1_8pa1_milling | project canonical_glass_key, base_time = ws1__8pa1__milling__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status),
+            (ws1_8pa1_eolcv | project canonical_glass_key, base_time = ws1__8pa1__eolcv__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = ws1__8pa1__eolcv__mest_pdlc, status = ws1__8pa1__eolcv__result),
+            (ws1_8pa1_defects_b | project canonical_glass_key, base_time = ws1__8pa1__defects_b__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ws1__8pa1__defects_b__status),
+            (ws1_8pa1_packing | project canonical_glass_key, base_time = ws1__8pa1__packing__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = ""),
+            (ws1_8pa1_curing | project canonical_glass_key, base_time = ws1__8pa1__curing__time, dmc_code, rfid, aura_code, pdlc_code, mest_result = "", status = "")
+        | where isnotempty(canonical_glass_key)
+        | summarize arg_max(base_time, dmc_code, rfid, aura_code, pdlc_code, mest_result, status) by canonical_glass_key;
+    glass_base
+    | project glass_key = canonical_glass_key, dmc_code, rfid, aura_code, pdlc_code, mest_result, status
+    | join kind = leftouter (ws1_2cw2 | project canonical_glass_key, ws1__2cw2__time, ws1__2cw2__rfid) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_3fw2 | project canonical_glass_key, ws1__3fw2__time, ws1__3fw2__rfid, ws1__3fw2__mold_number, ws1__3fw2__mold_type, ws1__3fw2__mold_temp, ws1__3fw2__furnace_ch1_temp, ws1__3fw2__furnace_ch3_temp, ws1__3fw2__furnace_ch5_temp) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_4aw2 | project canonical_glass_key, ws1__4aw2__time, ws1__4aw2__rfid) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_5fn6 | project canonical_glass_key, ws1__5fn6__final__time, ws1__5fn6__final__rfid) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws3_prim | project canonical_glass_key, ws3__prim__time, ws3__prim__rfid, ws3__prim__bottle1_code, ws3__prim__bottle2_code, ws3__prim__bottle3_code, ws3__prim__temp, ws3__prim__humidity, ws3__prim__inspec_rfid_write) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws3_prim_inspec | project canonical_glass_key, ws3__prim_inspec__time, ws3__prim_inspec__rfid) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws3_curing | project canonical_glass_key, ws3__curing__time, ws3__curing__rack_id, ws3__curing__entry_time, ws3__curing__entry_rfid_read, ws3__curing__curing_time, ws3__curing__is_departed, ws3__curing__departure_time, ws3__curing__departure_rfid_write, ws3__curing__write_status, ws3__curing__write_time) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws3_pu1 | project canonical_glass_key, ws3__pu1__time, ws3__pu1__rfid, ws3__pu1__temp, ws3__pu1__humidity, ws3__pu1__mold_up_zone01, ws3__pu1__mold_up_zone02, ws3__pu1__mold_down_zone01, ws3__pu1__mold_down_zone02) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_8pa1_milling | project canonical_glass_key, ws1__8pa1__milling__time, ws1__8pa1__milling__rfid, ws1__8pa1__milling__manual_upload, ws1__8pa1__milling__destination) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_8pa1_eolcv | project canonical_glass_key, ws1__8pa1__eolcv__time, ws1__8pa1__eolcv__rfid, ws1__8pa1__eolcv__mest_pdlc, ws1__8pa1__eolcv__lig_1, ws1__8pa1__eolcv__lig_2, ws1__8pa1__eolcv__result, ws1__8pa1__eolcv__front_sky_holder__time, ws1__8pa1__eolcv__front_sky_holder__part1_status, ws1__8pa1__eolcv__front_sky_holder__part2_status, ws1__8pa1__eolcv__front_sky_holder__part3_status, ws1__8pa1__eolcv__front_sky_holder__push2_status, ws1__8pa1__eolcv__ecu__time, ws1__8pa1__eolcv__ecu__a02prussure_status, ws1__8pa1__eolcv__led_harness__time, ws1__8pa1__eolcv__led_harness__qr_code, ws1__8pa1__eolcv__led_harness__status, ws1__8pa1__eolcv__pdlc__time, ws1__8pa1__eolcv__lig__time, ws1__8pa1__eolcv__llp_primer_glass__end_time, ws1__8pa1__eolcv__llp_primer_glass__bottle1_code, ws1__8pa1__eolcv__llp_primer_glass__bottle2_code, ws1__8pa1__eolcv__llp_primer_glass__bottle3_code, ws1__8pa1__eolcv__llp_primer_glass__bottle4_code, ws1__8pa1__eolcv__llp_primer_glass__bottle5_code, ws1__8pa1__eolcv__llp_primer_pu__end_time, ws1__8pa1__eolcv__llp_primer_pu__scan_code, ws1__8pa1__eolcv__llp_primer_pu__bottle1_code, ws1__8pa1__eolcv__llp_primer_pu__bottle2_code, ws1__8pa1__eolcv__llp_primer_pu__bottle3_code, ws1__8pa1__eolcv__llp_primer_pu__bottle4_code, ws1__8pa1__eolcv__llp_primer_pu__bottle5_code, ws1__8pa1__eolcv__eol_inspection__insp_time, ws1__8pa1__eolcv__llp_rework__end_time, ws1__8pa1__eolcv__llp_rework__scan_code, ws1__8pa1__eolcv__llp_rework__bottle1_code, ws1__8pa1__eolcv__llp_rework__bottle2_code, ws1__8pa1__eolcv__llp_rework__bottle3_code, ws1__8pa1__eolcv__llp_rework__bottle4_code, ws1__8pa1__eolcv__llp_rework__bottle5_code) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_8pa1_defects_b | project canonical_glass_key, ws1__8pa1__defects_b__time, ws1__8pa1__defects_b__rfid, ws1__8pa1__defects_b__primer_code, ws1__8pa1__defects_b__status, ws1__8pa1__defects_b__defects__check_time, ws1__8pa1__defects_b__defects__rework_code, ws1__8pa1__defects_b__marposs__time, ws1__8pa1__defects_b__marposs__status, ws1__8pa1__defects_b__llp_label__time, ws1__8pa1__defects_b__llp_label__code, ws1__8pa1__defects_b__unload_pack__time, ws1__8pa1__defects_b__unload_pack__status) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_8pa1_packing | project canonical_glass_key, ws1__8pa1__packing__time, ws1__8pa1__packing__rack_id, ws1__8pa1__packing__slot_id) on $left.glass_key == $right.canonical_glass_key
+    | join kind = leftouter (ws1_8pa1_curing | project canonical_glass_key, ws1__8pa1__curing__time, ws1__8pa1__curing__rack_id, ws1__8pa1__curing__entry_time, ws1__8pa1__curing__curing_time, ws1__8pa1__curing__is_departed, ws1__8pa1__curing__departure_time, ws1__8pa1__curing__departure_rfid_write, ws1__8pa1__curing__write_status, ws1__8pa1__curing__write_time) on $left.glass_key == $right.canonical_glass_key
+    | project-away canonical_glass_key, canonical_glass_key1, canonical_glass_key2, canonical_glass_key3, canonical_glass_key4, canonical_glass_key5, canonical_glass_key6, canonical_glass_key7, canonical_glass_key8, canonical_glass_key9, canonical_glass_key10, canonical_glass_key11, canonical_glass_key12
+}

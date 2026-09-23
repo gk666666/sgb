@@ -1,0 +1,444 @@
+// 缺陷正式运行链对象。
+//
+// 当前生产环境缺陷正式主链：
+// raw_defect_eh -> defect_std_all_v2 -> defect_plc_report_equivalent_v2
+// -> fn_defect_forward_candidates_scheme_b_v2 -> Azure Function。
+//
+// 对象说明：
+// - table defect_std_all_v2：当前正式全域缺陷标准化表。
+// - table defect_plc_report_equivalent_v2：当前正式缺陷等价表。
+// - table defect_forward_success：缺陷接口发送成功台账。
+// - table defect_forward_audit：缺陷接口发送审计台账。
+// - function fn_defect_*_materialize_v1：正式物化函数。
+// - policy defect_* update policy：把 raw 或上游标准表自动物化到正式表。
+// - function fn_defect_forward_candidates_scheme_b_v2：接口待发送候选函数。
+
+// 当前全量缺陷标准化总表，覆盖已接入的全部缺陷 family。
+.create-merge table defect_std_all_v2 (
+    plc_id:string,
+    factory:string,
+    record_role:string,
+    has_defect:bool,
+    payload_family:string,
+    source_time:datetime,
+    effective_source_time:datetime,
+    adx_ingest_time:datetime,
+    source_topic:string,
+    source_message_id:string,
+    dmc_code:string,
+    rfid:string,
+    rfid_prefix28:string,
+    aura_code:string,
+    pdlc_code:string,
+    glass_id:int,
+    model_id:int,
+    lig_code:string,
+    bracket_rfid_code:string,
+    primer_code:string,
+    mest_result:string,
+    status:string,
+    defect_report_time:datetime,
+    defect_report_time_source:string,
+    defect_report_post:string,
+    defect_code:string,
+    defect_name:string,
+    defect_nine_grid:string,
+    defect_surface:string,
+    ws3_timestamp:string,
+    ws3_bottle1_code:string,
+    ws3_bottle2_code:string,
+    ws3_bottle3_code:string,
+    ws3_temp:string,
+    ws3_humidity:string,
+    ws3_inspec_rfid_write:string,
+    ws3_mold_up_zone01:int,
+    ws3_mold_up_zone02:int,
+    ws3_mold_down_zone01:int,
+    ws3_mold_down_zone02:int,
+    entry_time:string,
+    milling_endtime:string,
+    process_st_milling:string,
+    process_st_heat:string,
+    process_st_priming:string,
+    process_heat_temp:string,
+    priming_code01:string,
+    priming_code02:string,
+    priming_code03:string,
+    priming_code04:string,
+    status_normalized:string,
+    defect_nine_grid_normalized:string,
+    watermark_time_utc:datetime,
+    watermark_time_local:datetime,
+    defect_report_time_local:datetime
+)
+
+// 当前全量缺陷最终等价表，默认发送链路直接使用这张表。
+.create-merge table defect_plc_report_equivalent_v2 (
+    plc_id:string,
+    factory:string,
+    dmc_code:string,
+    rfid:string,
+    aura_code:string,
+    pdlc_code:string,
+    lig_code:string,
+    bracket_rfid_code:string,
+    primer_code:string,
+    glass_id:int,
+    model_id:int,
+    mest_result:string,
+    status:string,
+    defect_report_time:datetime,
+    defect_report_time_source:string,
+    defect_report_post:string,
+    defect_code:string,
+    defect_name:string,
+    defect_nine_grid:string,
+    defect_surface:string,
+    record_role:string,
+    has_defect:bool,
+    payload_family:string,
+    source_time:datetime,
+    effective_source_time:datetime,
+    adx_ingest_time:datetime,
+    source_topic:string,
+    source_message_id:string,
+    rfid_prefix28:string,
+    ws3_timestamp:string,
+    ws3_bottle1_code:string,
+    ws3_bottle2_code:string,
+    ws3_bottle3_code:string,
+    ws3_temp:string,
+    ws3_humidity:string,
+    ws3_inspec_rfid_write:string,
+    ws3_mold_up_zone01:int,
+    ws3_mold_up_zone02:int,
+    ws3_mold_down_zone01:int,
+    ws3_mold_down_zone02:int,
+    entry_time:string,
+    milling_endtime:string,
+    process_st_milling:string,
+    process_st_heat:string,
+    process_st_priming:string,
+    process_heat_temp:string,
+    priming_code01:string,
+    priming_code02:string,
+    priming_code03:string,
+    priming_code04:string,
+    status_normalized:string,
+    defect_nine_grid_normalized:string,
+    defect_report_time_local:datetime,
+    watermark_time_utc:datetime,
+    watermark_time_local:datetime
+)
+
+// defect_forward_success：缺陷接口发送成功台账。
+// 正式候选函数 fn_defect_forward_candidates_scheme_b_v2 会读取这张表，对最近已成功发送的 plc_id 去重。
+.create-merge table defect_forward_success (
+    plc_id:string,
+    forward_target:string,
+    ack_time:datetime,
+    batch_id:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    payload_family:string,
+    factory:string
+)
+
+// defect_forward_audit：缺陷接口发送审计台账。
+// Function 每次调用接口的成功/失败、批次、水位推进和错误信息都会落到这里。
+.create-merge table defect_forward_audit (
+    plc_id:string,
+    forward_target:string,
+    attempt_time:datetime,
+    batch_id:string,
+    status:string,
+    http_status:string,
+    error_message:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    rows_in_batch:int,
+    payload_family:string,
+    factory:string
+)
+
+// v2 标准化层负责把确定性的字段处理前移到 ADX，
+// 再进入最终 equivalent_v2 物化层。
+.create-or-alter function with (folder = "defect/materialize", docstring = "Full-domain defect standardization result for materialization into defect_std_all_v2") fn_defect_std_all_v2_materialize_v1() {
+    fn_defect_std_union_v1()
+    | summarize arg_max(coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time), *) by plc_id
+    | extend
+        defect_report_time_local = iff(isnotnull(defect_report_time), datetime_utc_to_local(defect_report_time, "Asia/Shanghai"), datetime(null)),
+        raw_watermark_time_utc = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+    | extend
+        watermark_time_utc = case(
+            isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            raw_watermark_time_utc
+        )
+    | extend
+        watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null)),
+        status_normalized = case(
+            toupper(trim(@" ", tostring(status))) == "NG", "ng",
+            toupper(trim(@" ", tostring(status))) == "RW", "reworkable",
+            toupper(trim(@" ", tostring(status))) in ("M1", "M2", "OK"), "",
+            ""
+        ),
+        defect_nine_grid_normalized = case(
+            isempty(trim(@" ", tostring(defect_nine_grid))), "",
+            substring(trim(@" ", tostring(defect_nine_grid)), 0, 1) matches regex @"[A-Za-z]",
+                strcat(
+                    tolower(substring(trim(@" ", tostring(defect_nine_grid)), 0, 1)),
+                    trim(@" ", substring(trim(@" ", tostring(defect_nine_grid)), 1))
+                ),
+            strcat("a", trim(@" ", tostring(defect_nine_grid)))
+        )
+    | project
+        plc_id,
+        factory,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28,
+        aura_code,
+        pdlc_code,
+        glass_id,
+        model_id,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        defect_code,
+        defect_name,
+        defect_nine_grid,
+        defect_surface,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04,
+        status_normalized,
+        defect_nine_grid_normalized,
+        watermark_time_utc,
+        watermark_time_local,
+        defect_report_time_local
+}
+
+// 回填本质上是“受历史时间约束的类自连接”：
+// 1) 先选出仍缺业务键的记录；
+// 2) 用已落表 equivalent_v2 历史结果 + 当前批次构造历史池；
+// 3) 按 rfid_prefix28 关联，并限制 history_event_time <= current_event_time；
+// 4) 最后用 coalesce() 只补空的 dmc/aura/pdlc，不覆盖当前已有值。
+.create-or-alter function with (folder = "defect/materialize", docstring = "Full-domain equivalent defect result for materialization into defect_plc_report_equivalent_v2 using history-only RFID28 backfill") fn_defect_plc_report_equivalent_v2_materialize_v1() {
+    let source_batch =
+        defect_std_all_v2
+        | extend
+            raw_watermark_time_utc = coalesce(watermark_time_utc, effective_source_time, source_time, defect_report_time, adx_ingest_time)
+        | extend
+            watermark_time_utc = case(
+                isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                    coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+                isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                    coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+                raw_watermark_time_utc
+            )
+        | extend
+            watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null)),
+            candidate_event_time = watermark_time_utc;
+    let needs_backfill =
+        source_batch
+        | where (factory startswith "8PA1" or factory startswith "WS3")
+        | where isnotempty(rfid_prefix28)
+        | where isempty(dmc_code) or isempty(aura_code) or isempty(pdlc_code);
+    let history_base =
+        union
+            (
+                defect_plc_report_equivalent_v2
+                | where isnotempty(rfid_prefix28)
+                | project
+                    history_plc_id = plc_id,
+                    rfid_prefix28,
+                    history_event_time = coalesce(watermark_time_utc, effective_source_time, source_time, defect_report_time, adx_ingest_time),
+                    history_dmc_code = dmc_code,
+                    history_aura_code = aura_code,
+                    history_pdlc_code = pdlc_code
+            ),
+            (
+                source_batch
+                | where isnotempty(rfid_prefix28)
+                | project
+                    history_plc_id = plc_id,
+                    rfid_prefix28,
+                    history_event_time = candidate_event_time,
+                    history_dmc_code = dmc_code,
+                    history_aura_code = aura_code,
+                    history_pdlc_code = pdlc_code
+            );
+    let dmc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_dmc_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_dmc_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_dmc_code) by plc_id
+        | project plc_id, history_dmc_code;
+    let aura_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_aura_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_aura_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_aura_code) by plc_id
+        | project plc_id, history_aura_code;
+    let pdlc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_pdlc_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_pdlc_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_pdlc_code) by plc_id
+        | project plc_id, history_pdlc_code;
+    source_batch
+    | join kind = leftouter dmc_history_hits on plc_id
+    | join kind = leftouter aura_history_hits on plc_id
+    | join kind = leftouter pdlc_history_hits on plc_id
+    | extend
+        dmc_code = coalesce(dmc_code, history_dmc_code),
+        aura_code = coalesce(aura_code, history_aura_code),
+        pdlc_code = coalesce(pdlc_code, history_pdlc_code)
+    | summarize arg_max(watermark_time_utc, *) by plc_id
+    | project
+        plc_id,
+        factory,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        glass_id,
+        model_id,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        defect_code,
+        defect_name,
+        defect_nine_grid,
+        defect_surface,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id,
+        rfid_prefix28,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04,
+        status_normalized,
+        defect_nine_grid_normalized,
+        defect_report_time_local,
+        watermark_time_utc,
+        watermark_time_local
+}
+
+// 这是当前生产环境正式主链对应的 update policy。
+// Function 默认查询就是走这条链。
+// defect_std_all_v2 update policy：当前正式缺陷主链的第一层自动物化规则。
+// raw_defect_eh 是源表，fn_defect_std_all_v2_materialize_v1() 负责把全域 family 统一成 defect_std_all_v2。
+.alter table defect_std_all_v2 policy update @'[{"IsEnabled": true, "Source": "raw_defect_eh", "Query": "fn_defect_std_all_v2_materialize_v1()", "IsTransactional": false, "PropagateIngestionProperties": true}]'
+
+// defect_plc_report_equivalent_v2 update policy：当前正式缺陷主链的第二层自动物化规则。
+// defect_std_all_v2 是源表，fn_defect_plc_report_equivalent_v2_materialize_v1() 负责补业务键并输出正式等价表。
+.alter table defect_plc_report_equivalent_v2 policy update @'[{"IsEnabled": true, "Source": "defect_std_all_v2", "Query": "fn_defect_plc_report_equivalent_v2_materialize_v1()", "IsTransactional": false, "PropagateIngestionProperties": true}]'
+
+// 当前生产环境正式候选函数，Function 默认查这个函数。
+.create-or-alter function with (folder = "defect/forward", docstring = "Scheme B forward candidates v2: full-domain defect families with watermark overlap and dynamic success-ledger deduplication") fn_defect_forward_candidates_scheme_b_v2(watermark:datetime, overlap_minutes:long, success_lookback_hours:long, p_forward_target:string) {
+    let effective_start = watermark - totimespan(strcat(tostring(overlap_minutes), "m"));
+    let succeeded =
+        defect_forward_success
+        | where forward_target == p_forward_target
+        | where ack_time > ago(totimespan(strcat(tostring(success_lookback_hours), "h")))
+        | summarize arg_max(ack_time, *) by plc_id
+        | project plc_id;
+    defect_plc_report_equivalent_v2
+    | extend
+        raw_watermark_time_utc = coalesce(watermark_time_utc, effective_source_time, source_time, defect_report_time, adx_ingest_time)
+    | extend
+        watermark_time_utc = case(
+            isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            raw_watermark_time_utc
+        )
+    | extend
+        watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null))
+    | where watermark_time_utc > effective_start
+    | where watermark_time_utc between (datetime(2020-01-01) .. now() + 1d)
+    | summarize arg_max(watermark_time_utc, *) by plc_id
+    | join kind = leftanti succeeded on plc_id
+    | order by watermark_time_utc asc, plc_id asc
+}

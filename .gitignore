@@ -1,0 +1,20 @@
+*.pyc
+*.pyo
+__pycache__/
+.DS_Store
+.python_packages/
+.venv/
+.pytest_cache/
+
+dist/
+adx_delivery_current/
+adx_delivery_current*.zip
+function_app/function_app.py.zip
+.~*.xlsx
+
+function_app/local.settings.json
+
+# Real portal exports with live secrets stay out of git.
+portal_app_settings_可直接导入_全量兼容版.json
+portal_app_settings_可直接导入_全量兼容版_含print_snowflake.json
+portal_app_settings_print_snowflake_add_only.json

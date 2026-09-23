@@ -1,0 +1,532 @@
+// 这个脚本承接产量链路的核心业务层。
+//
+// 作用分三块：
+// 1) 定义分钟 / 小时 / 日 / 月 / recipe / Tellus 台账等物理表；
+// 2) 按 Java 原逻辑从 raw_ops_eh 重建 minute/hour/day/month；
+// 3) 通过 dim_prod_topic_registry 控制哪些 topic 参与重建、哪些允许发 Tellus。
+//
+// 这里的设计原则是“topic 行为配置化，核心计算逻辑统一化”，
+// 所以后续扩 topic 通常先改 registry，而不是直接改函数。
+//
+// 对象说明：
+// - table prod_output_minute / hour / day / month：产量分钟、小时、日、月结果表。
+// - table prod_recipe_change_event：配方切换事件表。
+// - table prod_recipe_interval：配方生效区间表。
+// - table prod_output_by_recipe：按配方归集的产量结果表。
+// - table prod_tellus_forward_success：Tellus 发送成功台账。
+// - table prod_tellus_forward_audit：Tellus 发送审计台账。
+// - function fn_prod_output_counter_raw_v1()：产量 raw 计数点解析层。
+// - function fn_prod_recipe_change_raw_v1() / events / intervals：配方变更及区间计算层。
+// - function fn_prod_counter_minute/hour/day/month_*：产量逐层汇总计算层。
+// - function fn_prod_output_by_recipe_v1()：按 recipe 归集产量。
+// - function fn_prod_tellus_forward_candidates_*：Tellus 发送候选层。
+
+// prod_output_minute：产量接口发送的核心业务底表，保存每个 topic 每分钟的产量结果。
+// Function 端推送 Tellus 时，实际就是从这张表衍生候选并组装接口报文。
+.create-merge table prod_output_minute (
+    metric_window_start: datetime,
+    topic: string,
+    workcenter: string,
+    line_name: string,
+    output_value: real,
+    shift: string,
+    calc_rule: string,
+    window_start: datetime,
+    window_end: datetime,
+    source_row_count: long,
+    rebuilt_at: datetime
+)
+
+// prod_output_hour：按小时汇总后的产量结果表。
+// fn_prod_counter_day_from_hour_v1 会继续基于它生成日表。
+.create-merge table prod_output_hour (
+    metric_window_start: datetime,
+    topic: string,
+    workcenter: string,
+    line_name: string,
+    output_value: real,
+    shift: string,
+    calc_rule: string,
+    rebuilt_at: datetime
+)
+
+// prod_output_day：按天汇总后的产量结果表。
+// fn_prod_counter_month_from_day_v1 会基于它继续汇总月表。
+.create-merge table prod_output_day (
+    metric_day: datetime,
+    day: string,
+    topic: string,
+    workcenter: string,
+    line_name: string,
+    output_value: real,
+    shift: string,
+    calc_rule: string,
+    rebuilt_at: datetime
+)
+
+// prod_output_month：按月汇总后的产量结果表，主要用于月度统计展示或对账。
+.create-merge table prod_output_month (
+    metric_month: datetime,
+    month: string,
+    topic: string,
+    workcenter: string,
+    line_name: string,
+    output_value: real,
+    shift: string,
+    calc_rule: string,
+    rebuilt_at: datetime
+)
+
+// prod_recipe_change_event：配方切换事件明细表。
+// Function 如需落地配方切换结果，或后续要审计配方变更，可用这张表承接。
+.create-merge table prod_recipe_change_event (
+    recipe_scope: string,
+    topic: string,
+    recipe_num: string,
+    change_time: datetime,
+    source_message_id: string,
+    rebuilt_at: datetime
+)
+
+// prod_recipe_interval：把配方切换事件展开成“某配方在哪个时间区间生效”的区间表。
+// fn_prod_output_by_recipe_v1 会按这个区间把分钟产量归到具体 recipe。
+.create-merge table prod_recipe_interval (
+    recipe_scope: string,
+    topic: string,
+    recipe_num: string,
+    change_time: datetime,
+    next_change_time: datetime,
+    interval_end_effective: datetime,
+    rebuilt_at: datetime
+)
+
+// prod_output_by_recipe：按 recipe 归集后的产量结果表。
+// 它依赖 prod_output_minute 和 prod_recipe_interval 对分钟产量做配方归属。
+.create-merge table prod_output_by_recipe (
+    recipe_scope: string,
+    recipe_num: string,
+    topic: string,
+    workcenter: string,
+    metric_window_start: datetime,
+    output_value: real,
+    shift: string,
+    rebuilt_at: datetime
+)
+
+// prod_tellus_forward_success：产量接口发送成功台账。
+// fn_prod_tellus_forward_candidates_with_success_v1 和 watermark 版本会用它做去重，防止重复推送。
+.create-merge table prod_tellus_forward_success (
+    forward_key: string,
+    forward_target: string,
+    ack_time: datetime,
+    batch_id: string,
+    function_instance_id: string,
+    topic: string,
+    workcenter: string,
+    metric_window_start: datetime,
+    output_value: real
+)
+
+// prod_tellus_forward_audit：产量接口发送审计台账。
+// Function 每次调用接口后的成功/失败、批次号、错误信息都会记录到这里。
+.create-merge table prod_tellus_forward_audit (
+    forward_key: string,
+    forward_target: string,
+    attempt_time: datetime,
+    batch_id: string,
+    status: string,
+    http_status: string,
+    error_message: string,
+    function_instance_id: string,
+    rows_in_batch: int,
+    topic: string,
+    workcenter: string,
+    metric_window_start: datetime,
+    output_value: real
+)
+
+// 产量 raw 入口：
+// 先用 registry 过滤出启用的 output_counter topic，
+// 再统一解析 point_value 和事件时间，供后续 minute/hour/day/month 重建使用。
+// fn_prod_output_counter_raw_v1：产量计数类 topic 的统一 raw 解析入口。
+// 它从 raw_ops_eh 读取原始计数点，并结合 dim_prod_topic_registry 过滤出启用 topic，供 minute/hour/day/month 全链路重建使用。
+.create-or-alter function with (folder = "prod/raw", docstring = "Raw numeric counter points used by Java DataCycleJob and SendPostApi-like logic") fn_prod_output_counter_raw_v1() {
+    raw_ops_eh
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter"
+        | project topic, workcenter, line_name, aggregation_rule, reset_rule, recipe_scope, build_minute, build_hour, build_day, build_month, tellus_sync
+    ) on topic
+    | extend payload = todynamic(payload)
+    | extend point_value_resolved = todouble(coalesce(point_value, payload.value, payload._value, payload.count, payload.qty, payload.total))
+    | where isnotnull(point_value_resolved)
+    | extend event_time_utc = coalesce(
+            unixtime_milliseconds_todatetime(source_time_ms),
+            todatetime(payload.timestamp),
+            todatetime(payload.ts),
+            todatetime(payload["time"]),
+            enqueued_time,
+            ingestion_time()
+        )
+    | project
+        event_time = datetime_utc_to_local(event_time_utc, "Asia/Shanghai"),
+        topic,
+        workcenter,
+        line_name,
+        point_value = point_value_resolved,
+        aggregation_rule,
+        reset_rule,
+        recipe_scope,
+        build_minute,
+        build_hour,
+        build_day,
+        build_month,
+        tellus_sync,
+        message_id
+}
+
+// recipe raw 入口：
+// 只处理 registry 中 domain_family == recipe_change 的 topic，
+// 供 recipe interval 和按配方归集的产量视图使用。
+// fn_prod_recipe_change_raw_v1：配方变更类 topic 的 raw 解析入口。
+// 它从 raw_ops_eh 取出 recipe_change topic，供后续 recipe 事件表和 recipe 区间函数使用。
+.create-or-alter function with (folder = "prod/raw", docstring = "Raw recipe change points used by Java EnergyJob and AutoClaveJobEnergy") fn_prod_recipe_change_raw_v1() {
+    raw_ops_eh
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "recipe_change"
+        | project topic, recipe_scope
+    ) on topic
+    | extend payload = todynamic(payload)
+    | extend recipe_num = trim(@" ", tostring(coalesce(payload.value, payload._value, payload.recipe_num, payload.recipeNumber, payload.recipe)))
+    | where isnotempty(recipe_num)
+    | extend change_time_utc = coalesce(
+            unixtime_milliseconds_todatetime(source_time_ms),
+            todatetime(payload.timestamp),
+            todatetime(payload.ts),
+            todatetime(payload["time"]),
+            enqueued_time,
+            ingestion_time()
+        )
+    | project
+        change_time = datetime_utc_to_local(change_time_utc, "Asia/Shanghai"),
+        topic,
+        recipe_scope,
+        recipe_num,
+        source_message_id = message_id
+}
+
+// fn_prod_recipe_events_v1：把原始配方切换消息整理成指定时间窗内的事件集。
+// 它读取 fn_prod_recipe_change_raw_v1，通常用于生成或校验 prod_recipe_change_event。
+.create-or-alter function with (folder = "prod/business", docstring = "Recipe change event set for a given time range") fn_prod_recipe_events_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    fn_prod_recipe_change_raw_v1()
+    | where change_time between (local_start_time .. local_end_time)
+    | summarize arg_max(change_time, *) by recipe_scope, topic, recipe_num, source_message_id
+    | extend rebuilt_at = now()
+    | project recipe_scope, topic, recipe_num, change_time, source_message_id, rebuilt_at
+}
+
+// fn_prod_recipe_intervals_v1：把配方切换事件整理成生效区间。
+// 下游 fn_prod_output_by_recipe_v1 依赖它判断每一分钟产量属于哪个 recipe。
+.create-or-alter function with (folder = "prod/business", docstring = "Recipe intervals matching Java findPreviousInterval semantics") fn_prod_recipe_intervals_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    fn_prod_recipe_change_raw_v1()
+    | where change_time <= local_end_time
+    | summarize arg_max(change_time, *) by recipe_scope, topic, source_message_id
+    | order by recipe_scope asc, change_time asc
+    | serialize
+    | extend next_change_time = iff(recipe_scope == next(recipe_scope), next(change_time), datetime(null))
+    | where change_time >= local_start_time or isnull(next_change_time) == false
+    | extend interval_end_effective = coalesce(next_change_time, local_end_time), rebuilt_at = now()
+    | project recipe_scope, topic, recipe_num, change_time, next_change_time, interval_end_effective, rebuilt_at
+}
+
+// 分钟重建是产量链最关键的一层：
+// 1) 只取 build_minute == true 的 topic；
+// 2) 先按分钟窗口聚合原始计数点，并取“该分钟最后一个点”作为分钟末值；
+// 3) 正常情况下按“当前有值分钟最后值 - 上一个有值分钟最后值”计算，并把差值记到当前分钟；
+// 4) 若当前分钟内部出现归零，则按“归零前增量 + 归零后增量”分段补偿：
+//    (归零前最大值 - 上一个有值分钟最后值) + (当前分钟最后值 + 1)；
+// 5) 若没有上一个有值分钟，则退回到原 minute 内部算法，避免首个有值分钟丢量；
+// 6) 若某分钟没有原始点，但落在 topic 有效覆盖区间内，则补 0。
+// fn_prod_counter_minute_rebuild_v1：产量分钟表的核心重建函数。
+// Function 会定时执行它把结果写入 prod_output_minute，后续小时/日/月汇总和 Tellus 发送都从这层继续往下走。
+.create-or-alter function with (folder = "prod/business", docstring = "Minute output rebuild using current-minute last value minus previous non-empty minute last value, with in-minute zero-reset compensation") fn_prod_counter_minute_rebuild_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    let minute_topics =
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and build_minute == true
+        | project topic, workcenter, line_name, aggregation_rule, reset_rule, recipe_scope, build_hour, build_day, build_month, tellus_sync;
+    let raw_points =
+        fn_prod_output_counter_raw_v1()
+        | where event_time between (local_start_time .. local_end_time)
+        | where build_minute == true
+        | extend metric_window_start = bin(event_time, 1m);
+    let minute_calc_base =
+        raw_points
+        | sort by topic asc, metric_window_start asc, event_time asc
+        | summarize
+            source_row_count = count(),
+            ordered_points = make_list(pack("event_time", event_time, "point_value", point_value), 4096)
+          by metric_window_start, topic, workcenter, line_name, reset_rule
+        | extend point_count = array_length(ordered_points)
+        | extend first_point = ordered_points[0]
+        | extend last_point = ordered_points[toint(point_count - 1)]
+        | extend earliest_value = todouble(first_point.point_value)
+        | extend latest_value = todouble(last_point.point_value)
+        | extend series_key = strcat(topic, "|", tostring(metric_window_start));
+    let zero_info =
+        minute_calc_base
+        | mv-apply with_itemindex = idx point = ordered_points on (
+            extend point_value = todouble(point.point_value)
+            | summarize first_zero_index = minif(idx, point_value == 0.0)
+        );
+    let before_zero =
+        minute_calc_base
+        | join kind = leftouter zero_info on series_key
+        | mv-apply with_itemindex = idx point = ordered_points on (
+            extend point_value = todouble(point.point_value)
+            | where isnull(first_zero_index) or idx < tolong(first_zero_index)
+            | summarize max_before_zero = max(point_value)
+        );
+    let minute_calc =
+        minute_calc_base
+        | join kind = leftouter zero_info on series_key
+        | join kind = leftouter before_zero on series_key
+        | sort by topic asc, metric_window_start asc
+        | serialize
+        | extend prev_nonempty_last_value = iff(topic == prev(topic), prev(latest_value), real(null))
+        | extend legacy_output_value = case(
+            latest_value >= earliest_value, latest_value - earliest_value + 1.0,
+            latest_value < earliest_value, ((iff(coalesce(max_before_zero, 0.0) > 0.0, max_before_zero, earliest_value)) - earliest_value + 1.0) + (latest_value + 1.0),
+            latest_value >= 0.0, latest_value,
+            0.0
+        )
+        | extend reset_before_zero_delta = case(
+            isnull(first_zero_index), real(null),
+            tolong(first_zero_index) == 0, 0.0,
+            isnull(prev_nonempty_last_value), max_before_zero - earliest_value + 1.0,
+            max_before_zero >= prev_nonempty_last_value, max_before_zero - prev_nonempty_last_value,
+            reset_rule == "counter_reset_to_zero", 0.0,
+            0.0
+        )
+        | extend output_value = case(
+            isnull(prev_nonempty_last_value), legacy_output_value,
+            isnotnull(first_zero_index), coalesce(reset_before_zero_delta, 0.0) + (latest_value + 1.0),
+            latest_value >= prev_nonempty_last_value, latest_value - prev_nonempty_last_value,
+            reset_rule == "counter_reset_to_zero" and latest_value == 0.0, 0.0,
+            reset_rule == "counter_reset_to_zero" and latest_value > 0.0, latest_value,
+            0.0
+        )
+        | extend calc_rule = case(
+            isnull(prev_nonempty_last_value) and latest_value >= earliest_value, "minute_seed_legacy_first_last_plus_one",
+            isnull(prev_nonempty_last_value) and latest_value < earliest_value, "minute_seed_legacy_zero_reset_compensation",
+            isnotnull(first_zero_index), "minute_last_value_delta_with_in_minute_reset_compensation",
+            latest_value >= prev_nonempty_last_value, "minute_last_value_delta_from_previous_nonempty",
+            reset_rule == "counter_reset_to_zero" and latest_value == 0.0, "minute_last_value_reset_to_zero",
+            reset_rule == "counter_reset_to_zero" and latest_value > 0.0, "minute_last_value_post_reset_current_value",
+            "minute_last_value_fallback_zero"
+        )
+        | project metric_window_start, topic, workcenter, line_name, output_value, source_row_count, calc_rule, earliest_value, latest_value, max_before_zero, prev_nonempty_last_value;
+    let topic_bounds =
+        raw_points
+        | summarize
+            topic_start = min(metric_window_start),
+            topic_end = max(metric_window_start)
+          by topic, workcenter, line_name;
+    let minute_grid =
+        topic_bounds
+        | extend metric_window_start = range(topic_start, topic_end, 1m)
+        | mv-expand metric_window_start to typeof(datetime)
+        | project metric_window_start, topic, workcenter, line_name;
+    minute_grid
+    | join kind = inner (
+        minute_topics
+        | project topic, workcenter, line_name
+    ) on topic, workcenter, line_name
+    | join kind = leftouter (
+        minute_calc
+        | project metric_window_start, topic, workcenter, line_name, output_value, source_row_count, calc_rule
+    ) on metric_window_start, topic, workcenter, line_name
+    | extend output_value = coalesce(output_value, 0.0)
+    | extend source_row_count = coalesce(source_row_count, 0)
+    | extend calc_rule = iff(source_row_count == 0, "minute_empty_fill_zero", calc_rule)
+    | extend shift = iff(datetime_part("Hour", metric_window_start) < 8 or datetime_part("Hour", metric_window_start) >= 20, "shift2", "shift1")
+    | extend window_start = metric_window_start, window_end = metric_window_start + 1m, rebuilt_at = now()
+    | project metric_window_start, topic, workcenter, line_name, output_value, shift, calc_rule, window_start, window_end, source_row_count, rebuilt_at
+}
+
+// 小时表不直接扫 raw，而是从分钟表汇总。
+// 这样可以把“补 0 / reset 补偿”统一收敛在 minute 层，小时层只做求和。
+// fn_prod_counter_hour_from_minute_v1：从分钟表汇总小时表。
+// 它直接读取 prod_output_minute，把 minute 层已经处理好的补 0 和 reset 逻辑汇总成小时结果。
+.create-or-alter function with (folder = "prod/business", docstring = "Hour output rebuilt from minute output and aligned with Java dataSta(hour)") fn_prod_counter_hour_from_minute_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    prod_output_minute
+    | where metric_window_start between (local_start_time .. local_end_time)
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and build_hour == true
+        | project topic
+    ) on topic
+    | summarize output_value = sum(output_value) by metric_window_start = bin(metric_window_start, 1h), topic, workcenter, line_name
+    | extend shift = iff(datetime_part("Hour", metric_window_start) < 8 or datetime_part("Hour", metric_window_start) >= 20, "shift2", "shift1")
+    | extend calc_rule = "java_hour_sum_from_minute", rebuilt_at = now()
+    | project metric_window_start, topic, workcenter, line_name, output_value, shift, calc_rule, rebuilt_at
+}
+
+// 日表从小时表汇总，并对 build_day == true 的 topic 按天、班次补齐空行。
+// fn_prod_counter_day_from_hour_v1：从小时表汇总日产量。
+// 它读取 prod_output_hour，对 build_day == true 的 topic 按天和班次补齐并汇总。
+.create-or-alter function with (folder = "prod/business", docstring = "Day output rebuilt from hour output and aligned with Java dataStaDay()") fn_prod_counter_day_from_hour_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    let day_grid =
+        range metric_day from startofday(local_start_time) to startofday(local_end_time) step 1d
+        | extend join_key = 1;
+    let shifts =
+        datatable(shift:string) ["shift1", "shift2"]
+        | extend join_key = 1;
+    let day_topics =
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and build_day == true
+        | project topic, workcenter, line_name
+        | extend join_key = 1;
+    let day_calc =
+        prod_output_hour
+        | where metric_window_start between (local_start_time .. local_end_time)
+        | summarize output_value = sum(output_value) by metric_day = startofday(metric_window_start), day = format_datetime(startofday(metric_window_start), "yyyy-MM-dd"), topic, workcenter, line_name, shift;
+    day_grid
+    | join kind = inner shifts on join_key
+    | join kind = inner day_topics on join_key
+    | project-away join_key
+    | join kind = leftouter day_calc on metric_day, topic, shift
+    | extend day = coalesce(day, format_datetime(metric_day, "yyyy-MM-dd"))
+    | extend output_value = coalesce(output_value, 0.0)
+    | extend calc_rule = "java_day_sum_from_hour", rebuilt_at = now()
+    | project metric_day, day, topic, workcenter, line_name, output_value, shift, calc_rule, rebuilt_at
+}
+
+// 月表从日表汇总，并对 build_month == true 的 topic 按月、班次补齐空行。
+// fn_prod_counter_month_from_day_v1：从日表汇总月产量。
+// 它读取 prod_output_day，对 build_month == true 的 topic 做月度累计。
+.create-or-alter function with (folder = "prod/business", docstring = "Month output rebuilt from day output and aligned with Java dataStaMonth()") fn_prod_counter_month_from_day_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    let month_grid =
+        range metric_month from startofmonth(local_start_time) to startofmonth(local_end_time) step 31d
+        | extend metric_month = startofmonth(metric_month)
+        | summarize by metric_month
+        | extend join_key = 1;
+    let shifts =
+        datatable(shift:string) ["shift1", "shift2"]
+        | extend join_key = 1;
+    let month_topics =
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and build_month == true
+        | project topic, workcenter, line_name
+        | extend join_key = 1;
+    let month_calc =
+        prod_output_day
+        | where metric_day between (startofday(local_start_time) .. startofday(local_end_time))
+        | summarize output_value = sum(output_value) by metric_month = startofmonth(metric_day), month = format_datetime(startofmonth(metric_day), "yyyy-MM"), topic, workcenter, line_name, shift;
+    month_grid
+    | join kind = inner shifts on join_key
+    | join kind = inner month_topics on join_key
+    | project-away join_key
+    | join kind = leftouter month_calc on metric_month, topic, shift
+    | extend month = coalesce(month, format_datetime(metric_month, "yyyy-MM"))
+    | extend output_value = coalesce(output_value, 0.0)
+    | extend calc_rule = "java_month_sum_from_day", rebuilt_at = now()
+    | project metric_month, month, topic, workcenter, line_name, output_value, shift, calc_rule, rebuilt_at
+}
+
+// 这层把分钟产量归到 recipe 区间里，便于做按配方统计。
+// fn_prod_output_by_recipe_v1：按 recipe 区间归集分钟产量。
+// 它同时依赖 prod_output_minute 和 fn_prod_recipe_intervals_v1，用于输出配方维度的产量结果。
+.create-or-alter function with (folder = "prod/business", docstring = "Output attributed to recipe intervals") fn_prod_output_by_recipe_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    let recipe_intervals =
+        fn_prod_recipe_intervals_v1(start_time, end_time);
+    prod_output_minute
+    | where metric_window_start between (local_start_time .. local_end_time)
+    | join kind = inner recipe_intervals on $left.workcenter == $right.recipe_scope
+    | where metric_window_start >= change_time and metric_window_start < interval_end_effective
+    | project recipe_scope, recipe_num, topic, workcenter, metric_window_start, output_value, shift, rebuilt_at = now()
+}
+
+// Tellus 候选层只看 minute 表，不重新扫 raw。
+// 是否允许进入发送范围完全由 registry 中 tellus_sync == true 控制。
+// fn_prod_tellus_forward_candidates_v1：产量接口的基础候选视图。
+// 它只从 prod_output_minute 取 tellus_sync == true 的 topic，不做 success 去重，主要用于基础核对。
+.create-or-alter function with (folder = "prod/business", docstring = "Minute output rows that should be forwarded using the original Java SendPostApi topic scope") fn_prod_tellus_forward_candidates_v1(start_time:datetime, end_time:datetime) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    prod_output_minute
+    | where metric_window_start between (local_start_time .. local_end_time)
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and tellus_sync == true
+        | project topic
+    ) on topic
+    | order by metric_window_start asc, topic asc
+}
+
+// 正式 Tellus 候选层会在候选基础上再做 success 去重，
+// 防止同一 topic/workcenter/minute 窗口在短时间内重复发送。
+// success_lookback_hours 由 Function 端动态传入：
+// 正常运行时窗口较小，接口停用后补数时窗口会自动放大。
+// fn_prod_tellus_forward_candidates_with_success_v1：正式发送前的候选视图。
+// 它在基础候选上再结合 prod_tellus_forward_success 去重，避免最近已成功发送的数据再次推送。
+.create-or-alter function with (folder = "prod/business", docstring = "Minute output rows that should be forwarded after excluding recent successful Tellus sends") fn_prod_tellus_forward_candidates_with_success_v1(start_time:datetime, end_time:datetime, p_forward_target:string, success_lookback_hours:long) {
+    let local_start_time = datetime_utc_to_local(start_time, "Asia/Shanghai");
+    let local_end_time = datetime_utc_to_local(end_time, "Asia/Shanghai");
+    let succeeded =
+        prod_tellus_forward_success
+        | where forward_target == p_forward_target
+        | where ack_time > ago(totimespan(strcat(tostring(success_lookback_hours), "h")))
+        | summarize arg_max(ack_time, *) by topic, workcenter, metric_window_start
+        | project topic, workcenter, metric_window_start;
+    prod_output_minute
+    | where metric_window_start between (local_start_time .. local_end_time)
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and tellus_sync == true
+        | project topic
+    ) on topic
+    | join kind = leftanti succeeded on topic, workcenter, metric_window_start
+    | order by metric_window_start asc, topic asc
+}
+
+// watermark 版候选层与缺陷 forward 模型保持一致：
+// 1) 用 blob watermark 代表产量 forward 已推进到的最新 minute 业务时间；
+// 2) 再向前回看 overlap_minutes，避免漏掉晚到或重建修正数据；
+// 3) 仍用 success 表对最近已成功发送记录做 leftanti 去重。
+// fn_prod_tellus_forward_candidates_with_watermark_v1：当前线上实际使用的产量接口候选函数。
+// Function 会把 watermark、overlap 和 forward_target 传进来；它从 prod_output_minute 取增量数据，并结合 prod_tellus_forward_success 去重后输出待发送行。
+.create-or-alter function with (folder = "prod/business", docstring = "Minute output rows that should be forwarded using blob watermark, overlap window and success-ledger deduplication") fn_prod_tellus_forward_candidates_with_watermark_v1(watermark:datetime, overlap_minutes:long, p_forward_target:string, success_lookback_hours:long) {
+    let local_watermark = datetime_utc_to_local(watermark, "Asia/Shanghai");
+    let local_effective_start = local_watermark - totimespan(strcat(tostring(overlap_minutes), "m"));
+    let succeeded =
+        prod_tellus_forward_success
+        | where forward_target == p_forward_target
+        | where ack_time > ago(totimespan(strcat(tostring(success_lookback_hours), "h")))
+        | summarize arg_max(ack_time, *) by topic, workcenter, metric_window_start
+        | project topic, workcenter, metric_window_start;
+    prod_output_minute
+    | where metric_window_start > local_effective_start
+    | join kind = inner (
+        dim_prod_topic_registry
+        | where is_enabled == true and domain_family == "output_counter" and tellus_sync == true
+        | project topic
+    ) on topic
+    | summarize arg_max(metric_window_start, *) by topic, workcenter, metric_window_start
+    | join kind = leftanti succeeded on topic, workcenter, metric_window_start
+    | order by metric_window_start asc, topic asc
+}

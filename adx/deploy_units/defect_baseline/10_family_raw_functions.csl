@@ -1,0 +1,120 @@
+// 缺陷 family raw 函数层。
+//
+// 这层的职责很单一：
+// - 只按 topic 从 raw_defect_eh 中切出各 family 原始记录
+// - 不在这里做 payload 解析、补键和最终去重
+//
+// *_raw_v1() 供全量函数视图或调试使用；
+// *_raw_since_v1(start_time) 供增量试算或降低内存占用时使用。
+//
+// 对象说明：
+// - function fn_defect_final_raw_v1 / since：提取 Final 5FN6 原始消息。
+// - function fn_defect_8pa1_eol_raw_v1 / since：提取 8PA1 EOL 原始消息。
+// - function fn_defect_8pa1_milling_raw_v1 / since：提取 8PA1 Milling 原始消息。
+// - function fn_defect_ws3_prim_raw_v1 / since：提取 WS3 PRIM 原始消息。
+// - function fn_defect_ws3_prim_inspec_raw_v1 / since：提取 WS3 PRIM_INSPEC 原始消息。
+// - function fn_defect_ws3_pu1_raw_v1 / since：提取 WS3 PU1 原始消息。
+
+// fn_defect_final_raw_v1：从 raw_defect_eh 中筛出 Final/5FN6 原始报文。
+// 下游 fn_defect_final_std_v1 会直接调用它，把 Final 原始消息继续标准化。
+.create-or-alter function with (folder = "defect/raw", docstring = "Final 5FN6 raw messages from raw_defect_eh") fn_defect_final_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/WS1/Final/5FN6/Defects"
+}
+
+// since 版本会先按 emqx_ts 折算出的业务时间裁窗口，
+// 这样可以把时间过滤尽量前推到 raw 层，减少后续解析层扫描量。
+// fn_defect_final_raw_since_v1：Final/5FN6 的增量原始视图。
+// 先在 raw 层按业务时间裁窗口，供 fn_defect_final_std_since_v1 做增量标准化，减少扫描量。
+.create-or-alter function with (folder = "defect/raw", docstring = "Final 5FN6 raw messages since start_time using EMQX event time as the primary business clock") fn_defect_final_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/WS1/Final/5FN6/Defects"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}
+
+// fn_defect_8pa1_eol_raw_v1：从 raw_defect_eh 中筛出 8PA1 EOL 原始报文。
+// 下游 fn_defect_8pa1_eol_std_v1 直接基于它做 8PA1 EOL 标准化。
+.create-or-alter function with (folder = "defect/raw", docstring = "8PA1 EOL raw messages from raw_defect_eh") fn_defect_8pa1_eol_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/WS1/8PA1/Defects"
+}
+
+// fn_defect_8pa1_eol_raw_since_v1：8PA1 EOL 的增量原始视图。
+// 供 fn_defect_8pa1_eol_std_since_v1 在增量窗口内做标准化和重算。
+.create-or-alter function with (folder = "defect/raw", docstring = "8PA1 EOL raw messages since start_time using EMQX event time as the primary business clock") fn_defect_8pa1_eol_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/WS1/8PA1/Defects"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}
+
+// fn_defect_8pa1_milling_raw_v1：从 raw_defect_eh 中筛出 8PA1 Milling 原始报文。
+// 下游 fn_defect_8pa1_milling_std_v1 会把这批原始消息解析成统一缺陷 schema。
+.create-or-alter function with (folder = "defect/raw", docstring = "8PA1 Milling raw messages from raw_defect_eh") fn_defect_8pa1_milling_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/WS1/8PA1_Milling/Defects"
+}
+
+// fn_defect_8pa1_milling_raw_since_v1：8PA1 Milling 的增量原始视图。
+// 供 fn_defect_8pa1_milling_std_since_v1 做增量标准化。
+.create-or-alter function with (folder = "defect/raw", docstring = "8PA1 Milling raw messages since start_time using EMQX event time as the primary business clock") fn_defect_8pa1_milling_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/WS1/8PA1_Milling/Defects"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}
+
+// fn_defect_ws3_prim_raw_v1：从 raw_defect_eh 中筛出 WS3 PRIM 原始报文。
+// 下游 fn_defect_ws3_prim_std_v1 用它生成 WS3 PRIM 的标准化无缺陷证据记录。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PRIM raw messages from raw_defect_eh") fn_defect_ws3_prim_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM"
+}
+
+// fn_defect_ws3_prim_raw_since_v1：WS3 PRIM 的增量原始视图。
+// 供 fn_defect_ws3_prim_std_since_v1 在近窗内重算标准化结果。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PRIM raw messages since start_time using EMQX event time as the primary business clock") fn_defect_ws3_prim_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}
+
+// fn_defect_ws3_prim_inspec_raw_v1：从 raw_defect_eh 中筛出 WS3 PRIM_INSPEC 原始报文。
+// 下游 fn_defect_ws3_prim_inspec_std_v1 用它生成 PRIM_INSPEC 标准化记录。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PRIM_INSPEC raw messages from raw_defect_eh") fn_defect_ws3_prim_inspec_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM_INSPEC"
+}
+
+// fn_defect_ws3_prim_inspec_raw_since_v1：WS3 PRIM_INSPEC 的增量原始视图。
+// 供 fn_defect_ws3_prim_inspec_std_since_v1 做增量标准化。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PRIM_INSPEC raw messages since start_time using EMQX event time as the primary business clock") fn_defect_ws3_prim_inspec_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PRIM_INSPEC"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}
+
+// fn_defect_ws3_pu1_raw_v1：从 raw_defect_eh 中筛出 WS3 PU1 原始报文。
+// 下游 fn_defect_ws3_pu1_std_v1 用它生成 PU1 的标准化记录。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PU1 raw messages from raw_defect_eh") fn_defect_ws3_pu1_raw_v1() {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PU1"
+}
+
+// fn_defect_ws3_pu1_raw_since_v1：WS3 PU1 的增量原始视图。
+// 供 fn_defect_ws3_pu1_std_since_v1 在时间窗内做增量标准化。
+.create-or-alter function with (folder = "defect/raw", docstring = "WS3 PU1 raw messages since start_time using EMQX event time as the primary business clock") fn_defect_ws3_pu1_raw_since_v1(start_time:datetime) {
+    raw_defect_eh
+    | where topic == "SGH/MB_Traceability_Matrix/WS3/PU1"
+    | extend raw_event_time = coalesce(unixtime_milliseconds_todatetime(emqx_ts), ingestion_time())
+    | where raw_event_time >= start_time
+    | project-away raw_event_time
+}

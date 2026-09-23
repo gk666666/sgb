@@ -1,0 +1,259 @@
+// 对象说明：
+// - function fn_defect_final_std_from_raw_v1(...)：把 Final 5FN6 raw 输入直接标准化成统一缺陷明细。
+// - function fn_defect_final_std_v1()：基于 Final raw 视图输出全量标准化结果。
+// - function fn_defect_final_std_since_v1(start_time)：输出指定时间窗内的增量标准化结果。
+
+// fn_defect_final_std_from_raw_v1：把 Final/5FN6 原始消息解析成统一缺陷标准结构。
+// 输入通常来自 fn_defect_final_raw_v1 或 fn_defect_final_raw_since_v1，输出会被 fn_defect_final_std_v1 和 materialize 层继续使用。
+.create-or-alter function with (folder = "defect/std", docstring = "Final/5FN6 standardized defect rows from raw input, including no-defect-evidence rows") fn_defect_final_std_from_raw_v1(T:(enqueued_time:datetime, emqx_ts:long, topic:string, device_name:string, message_id:string, payload:dynamic)) {
+    let base =
+        T
+        | where topic == "SGH/WS1/Final/5FN6/Defects"
+        | extend
+            payload = todynamic(payload),
+            adx_ingest_time = ingestion_time()
+        | extend
+            emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+        | extend
+            source_time = coalesce(emqx_event_time, adx_ingest_time)
+        | extend
+            dmc_code = trim(@" ", coalesce(tostring(payload.dmc_code), tostring(payload["DMC Code"]), tostring(payload.DMC_Code), tostring(payload["DMC code"]))),
+            rfid = trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.RFID), tostring(payload.rfid))),
+            aura_code = trim(@" ", coalesce(tostring(payload.aura_code), tostring(payload["Aura Code"]), tostring(payload.Aura_Code), tostring(payload["Aura code"]))),
+            pdlc_code = trim(@" ", coalesce(tostring(payload.pdlc_code), tostring(payload["PDLC Code"]), tostring(payload.PDLC_Code), tostring(payload["PDLC code"]))),
+            mest_result = trim(@" ", tostring(payload.mest_result)),
+            status = trim(@" ", tostring(payload.status)),
+            glass_id = toint(payload.glass_id),
+            model_id = toint(payload.model_id),
+            defects_array = todynamic(payload.defects),
+            payload_family = "final",
+            factory = "Final",
+            source_topic = topic,
+            source_message_id = message_id,
+            rfid_prefix28 = substring(trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.RFID), tostring(payload.rfid))), 0, 28);
+    let expanded_defects =
+        base
+        | where isnotnull(defects_array) and array_length(defects_array) > 0
+        | mv-expand defect = defects_array to typeof(dynamic)
+        | extend
+            defect_report_post = trim(@" ", tostring(defect.report_post)),
+            report_time_raw = tostring(defect.report_time),
+            defect_surface = trim(@" ", tostring(defect.surface))
+        | extend
+            report_time_local_text =
+                case(
+                    report_time_raw matches regex @"(Z|z)$", substring(report_time_raw, 0, strlen(report_time_raw) - 1),
+                    report_time_raw matches regex @"[+\-]\d{2}:\d{2}$", substring(report_time_raw, 0, strlen(report_time_raw) - 6),
+                    report_time_raw
+                )
+        | extend
+            report_time_dt = todatetime(report_time_local_text)
+        | extend
+            defect_report_time = coalesce(
+                case(
+                    isempty(report_time_raw), datetime(null),
+                    datetime_local_to_utc(report_time_dt, "Asia/Shanghai")
+                ),
+                source_time,
+                adx_ingest_time
+            ),
+            defect_report_time_source = iff(
+                isnotempty(report_time_raw),
+                "payload_report_time",
+                iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")
+            ),
+            grid_values = pack_array(
+                tostring(defect.nine_grid1),
+                tostring(defect.nine_grid2),
+                tostring(defect.nine_grid3),
+                tostring(defect.nine_grid4),
+                tostring(defect.nine_grid5),
+                tostring(defect.nine_grid6),
+                tostring(defect.nine_grid7),
+                tostring(defect.nine_grid8),
+                tostring(defect.nine_grid9)
+            );
+    let exploded_grids =
+        expanded_defects
+        | mv-expand with_itemindex = grid_index grid_hex = grid_values to typeof(string)
+        | extend
+            grid_pos = toint(grid_index) + 1,
+            hex_clean = replace_regex(replace_string(toupper(tostring(grid_hex)), "0X", ""), @"[^0-9A-F]", "")
+        | extend
+            hex_16 = substring(strcat("0000000000000000", hex_clean), strlen(strcat("0000000000000000", hex_clean)) - 16, 16)
+        | extend
+            hex_chars = extract_all(@"([0-9A-F])", hex_16)
+        | where isnotempty(hex_clean);
+    let grid_bits =
+        exploded_grids
+        | mv-expand with_itemindex = nibble_idx nibble = hex_chars to typeof(string)
+        | join kind = inner dim_hex_nibble_map on $left.nibble == $right.nibble
+        | order by source_message_id asc, defect_report_time asc, defect_report_post asc, grid_pos asc, nibble_idx asc
+        | summarize bit_chunks = make_list(bits) by
+            source_time,
+            adx_ingest_time,
+            source_topic,
+            source_message_id,
+            payload_family,
+            factory,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            defect_surface,
+            grid_pos
+        | extend bit_string = strcat_array(bit_chunks, "")
+        | where strlen(bit_string) == 64;
+    let defect_hits =
+        grid_bits
+        | mv-expand bit_pos = range(1, 64, 1) to typeof(long)
+        | where substring(bit_string, 64 - toint(bit_pos), 1) == "1"
+        | join kind = leftouter dim_defectlist_5fn6 on $left.bit_pos == $right.bit_pos
+        | extend
+            mapped_defect_code = defect_code,
+            grid_row_index = case(grid_pos in (1, 2, 3), 0, grid_pos in (4, 5, 6), 1, 2)
+        | extend
+            grid_col_index = case(grid_pos in (1, 4, 7), 0, grid_pos in (2, 5, 8), 1, 2)
+        | extend
+            normalized_col_index = iff(tolower(defect_surface) == "s4", 2 - grid_col_index, grid_col_index)
+        | extend
+            defect_nine_grid = strcat(
+                case(grid_row_index == 0, "a", grid_row_index == 1, "b", "c"),
+                tostring(normalized_col_index + 1)
+            )
+        | extend
+            plc_id = hash_md5(strcat(coalesce(dmc_code, rfid, ""), "|", tostring(defect_report_time), "|", defect_report_post, "|g", tostring(grid_pos), "|p", tostring(bit_pos), "|", mapped_defect_code)),
+            record_role = "defect",
+            has_defect = true,
+            effective_source_time = coalesce(source_time, adx_ingest_time, defect_report_time)
+        | project
+            plc_id,
+            factory,
+            record_role,
+            has_defect,
+            payload_family,
+            source_time,
+            effective_source_time,
+            adx_ingest_time,
+            source_topic,
+            source_message_id,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            defect_code = mapped_defect_code,
+            defect_name = "",
+            defect_nine_grid,
+            defect_surface;
+    let latest_expanded_for_no_defect =
+        expanded_defects
+        | summarize arg_max(defect_report_time, *) by source_message_id
+        | project
+            source_message_id,
+            source_time,
+            adx_ingest_time,
+            source_topic,
+            payload_family,
+            factory,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post;
+    let base_no_array_for_no_defect =
+        base
+        | where isnull(defects_array) or array_length(defects_array) == 0
+        | project
+            source_message_id,
+            source_time,
+            adx_ingest_time,
+            source_topic,
+            payload_family,
+            factory,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            defect_report_time = coalesce(source_time, adx_ingest_time),
+            defect_report_time_source = iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time"),
+            defect_report_post = "";
+    let no_defect_source =
+        union latest_expanded_for_no_defect, base_no_array_for_no_defect
+        | summarize arg_max(defect_report_time, *) by source_message_id;
+    let no_defect_rows =
+        no_defect_source
+        | join kind = leftanti (defect_hits | distinct source_message_id) on source_message_id
+        | extend
+            plc_id = hash_md5(strcat(coalesce(dmc_code, ""), "_", coalesce(rfid, ""), "_", tostring(source_time))),
+            record_role = "no_defect_evidence",
+            has_defect = false,
+            effective_source_time = coalesce(source_time, adx_ingest_time, defect_report_time)
+        | project
+            plc_id,
+            factory,
+            record_role,
+            has_defect,
+            payload_family,
+            source_time,
+            effective_source_time,
+            adx_ingest_time,
+            source_topic,
+            source_message_id,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            defect_code = "",
+            defect_name = "",
+            defect_nine_grid = "",
+            defect_surface = "";
+    union defect_hits, no_defect_rows
+}
+
+// fn_defect_final_std_v1：Final/5FN6 的全量标准化结果视图。
+// 它直接读取 fn_defect_final_raw_v1，并作为当前全域缺陷 union 逻辑的一部分继续参与正式链物化。
+.create-or-alter function with (folder = "defect/std", docstring = "Final/5FN6 standardized defect rows, including no-defect-evidence rows") fn_defect_final_std_v1() {
+    fn_defect_final_std_from_raw_v1(fn_defect_final_raw_v1())
+}
+
+// fn_defect_final_std_since_v1：Final/5FN6 的增量标准化结果视图。
+// 它读取 fn_defect_final_raw_since_v1，主要用于按时间窗验证、补算和排查。
+.create-or-alter function with (folder = "defect/std", docstring = "Final/5FN6 standardized defect rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_final_std_since_v1(start_time:datetime) {
+    fn_defect_final_std_from_raw_v1(fn_defect_final_raw_since_v1(start_time))
+}

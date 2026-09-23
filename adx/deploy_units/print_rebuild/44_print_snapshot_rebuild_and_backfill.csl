@@ -1,0 +1,89 @@
+// Print / 丝网链路重建脚本
+//
+// 使用前建议：
+// 1) 先确认 raw_print_eh 中已经有最新 4 个 topic；
+// 2) 建议在低峰时段执行，并尽量暂停 print 数据流；
+// 3) 本脚本会重建 print_snapshot_std，然后从 raw_print_eh 回灌历史数据。
+//
+// 对象说明：
+// - policy delete：先移除 print_snapshot_std 的 update policy，避免重建时持续写入。
+// - table drop/create print_snapshot_std：按新字段定义重建标准快照表。
+// - function fn_print_snapshot_materialize()：重建后使用的新标准化函数。
+// - policy print_snapshot_std update policy：回灌完成后重新恢复自动物化。
+
+// 删除 print_snapshot_std 的 update policy：重建期间先暂停自动写入，避免边删边写。
+.delete table print_snapshot_std policy update
+
+// 删除旧版 print_snapshot_std：为按新字段定义重建标准快照表做准备。
+.drop table print_snapshot_std ifexists
+
+// 重建后的 print_snapshot_std：承接新的 Print/丝网标准快照结构。
+// 回灌完成后，查询和后续自动物化都会继续落到这张表。
+.create table print_snapshot_std (
+    read_time: datetime,
+    topic: string,
+    workcenter: string,
+    equipment: string,
+    status: int,
+    dmc_code: string,
+    rfid_code: string,
+    print_cnt: long,
+    print_spd: int,
+    print_stroke: int,
+    ink_ret_spd: int,
+    ink_ret_stroke: int,
+    off_contact_hgt: int,
+    off_contact_ratio: real,
+    silk_screen_life: long,
+    silk_screen_status: string,
+    ir1_maxtemp: real,
+    ir1_mintemp: real,
+    ir1_curtemp: real,
+    ir2_maxtemp: real,
+    ir2_mintemp: real,
+    ir2_curtemp: real,
+    dry1_speed: real
+)
+
+// fn_print_snapshot_materialize：重建后使用的标准化函数。
+// 它从 raw_print_eh 重新解析原始报文，供 set-or-append 回灌和恢复 update policy 使用。
+.create-or-alter function with (folder = "print/std", docstring = "PRINT/SILK SCREEN standardized rows from raw_print_eh") fn_print_snapshot_materialize() {
+    raw_print_eh
+    | where topic in (
+        "SGH/WS1/NMF180/2CW6/PRINT1",
+        "SGH/WS1/NMF180/2CW6/PRINT2",
+        "SGH/WS1/NMF180/2CW6/PRINT3",
+        "SGH/WS1/MF180/2CW2/PRINT3"
+    )
+    | extend p = todynamic(payload)
+    | project
+        read_time = todatetime(tostring(p.read_time)),
+        topic,
+        workcenter = tostring(p.workcenter),
+        equipment = tostring(p.equipment),
+        status = toint(p.status),
+        dmc_code = tostring(p.dmc_code),
+        rfid_code = tostring(p.rfid_code),
+        print_cnt = tolong(p.print_cnt),
+        print_spd = toint(p.print_spd),
+        print_stroke = toint(p.print_stroke),
+        ink_ret_spd = toint(p.ink_ret_spd),
+        ink_ret_stroke = toint(p.ink_ret_stroke),
+        off_contact_hgt = toint(p.off_contact_hgt),
+        off_contact_ratio = todouble(p.off_contact_ratio),
+        silk_screen_life = tolong(p.silk_screen_life),
+        silk_screen_status = tostring(p.silk_screen_status),
+        ir1_maxtemp = todouble(p.ir1_maxtemp),
+        ir1_mintemp = todouble(p.ir1_mintemp),
+        ir1_curtemp = todouble(p.ir1_curtemp),
+        ir2_maxtemp = todouble(p.ir2_maxtemp),
+        ir2_mintemp = todouble(p.ir2_mintemp),
+        ir2_curtemp = todouble(p.ir2_curtemp),
+        dry1_speed = todouble(p.dry1_speed)
+}
+
+// 历史回灌：用新的标准化函数把 raw_print_eh 里的历史数据重新灌入新建的 print_snapshot_std。
+.set-or-append print_snapshot_std <| fn_print_snapshot_materialize()
+
+// 恢复 print_snapshot_std 的 update policy：重建和历史回灌完成后，重新启用后续增量自动物化。
+.alter table print_snapshot_std policy update @'[{"IsEnabled":true,"Source":"raw_print_eh","Query":"fn_print_snapshot_materialize()","IsTransactional":false,"PropagateIngestionProperties":true}]'

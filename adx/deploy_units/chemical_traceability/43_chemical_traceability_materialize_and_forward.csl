@@ -1,0 +1,201 @@
+// 化学品追溯链路单独维护，避免和现有缺陷/主数据/产量脚本混在一起。
+//
+// 当前链路：
+// raw_chemical_traceability_eh -> chemical_traceability_std
+// -> fn_chemical_traceability_forward_candidates -> Azure Function
+//
+// 来源 topic：
+// 1) SGH/8PAA/Chem/Track/C02
+// 2) SGH/8PAA/Chem/Track/C03
+// 3) SGH/8PAA/Chem/Track/C05
+// 4) SGH/8PAA/Chem/Track/C07
+// 5) SGH/8PAA/Chem/Track/C09
+//
+// 对象说明：
+// - table raw_chemical_traceability_eh：化学品追溯原始入湖表，保留 Event Hub 原始消息。
+// - policy raw_chemical_traceability_eh streamingingestion：给 raw 表开启流式摄取。
+// - table chemical_traceability_std：化学品追溯标准表，输出接口固定字段。
+// - table chemical_traceability_forward_success：接口发送成功台账。
+// - table chemical_traceability_forward_audit：接口发送审计台账。
+// - function fn_chemical_traceability_materialize()：把 raw 消息清洗成标准业务字段。
+// - policy chemical_traceability_std update policy：把 raw 新数据自动写入标准表。
+// - function fn_chemical_traceability_forward_candidates(...)：按 watermark + success ledger 取待发送候选。
+
+// raw_chemical_traceability_eh：化学品追溯链的原始入湖表，只保存 Event Hub 原始消息。
+// 下游 fn_chemical_traceability_materialize() 会直接从这张表读取并做字段标准化。
+.create-merge table raw_chemical_traceability_eh (
+    enqueued_time: datetime,
+    emqx_ts: long,
+    topic: string,
+    device_name: string,
+    message_id: string,
+    payload: dynamic
+)
+
+// raw_chemical_traceability_eh_json：raw_chemical_traceability_eh 的 JSON ingestion mapping。
+// Event Hub Data Connection 用这个 mapping 把化学品追溯原始消息落到 raw 表。
+.create-or-alter table raw_chemical_traceability_eh ingestion json mapping "raw_chemical_traceability_eh_json" '[{"column":"enqueued_time","path":"$.enqueued_time","datatype":"datetime"},{"column":"emqx_ts","path":"$.emqx_ts","datatype":"long"},{"column":"topic","path":"$.topic","datatype":"string"},{"column":"device_name","path":"$.device_name","datatype":"string"},{"column":"message_id","path":"$.message_id","datatype":"string"},{"column":"payload","path":"$.payload","datatype":"dynamic"}]'
+
+// 为 raw 表显式开启 streaming ingestion。
+// 注意：此命令生效前，ADX cluster 级也必须先开启 streaming ingestion。
+// raw_chemical_traceability_eh streamingingestion policy：给化学品追溯 raw 表开启流式摄取。
+// 作用是让 Event Hub 进来的原始消息更快可查、更快进入下游 update policy。
+.alter table raw_chemical_traceability_eh policy streamingingestion '{"IsEnabled": true}'
+
+// chemical_traceability_std：化学品追溯标准表，承接接口需要的固定业务字段。
+// Function 端不会直接扫 raw，而是从这张标准表按 watermark 取发送候选。
+.create-merge table chemical_traceability_std (
+    plc_id:string,
+    dmc_code:string,
+    data_time:string,
+    report_post:string,
+    workcenter:string,
+    station:string,
+    source_topic:string,
+    source_message_id:string,
+    source_time:datetime,
+    adx_ingest_time:datetime,
+    watermark_time_utc:datetime,
+    watermark_time_local:datetime,
+    raw_payload:dynamic
+)
+
+// chemical_traceability_forward_success：化学品追溯接口发送成功台账。
+// fn_chemical_traceability_forward_candidates 会读这张表，对近期成功发送过的 plc_id 去重。
+.create-merge table chemical_traceability_forward_success (
+    plc_id:string,
+    forward_target:string,
+    ack_time:datetime,
+    batch_id:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    source_topic:string,
+    workcenter:string,
+    report_post:string
+)
+
+// chemical_traceability_forward_audit：化学品追溯接口发送审计台账。
+// Function 每次接口调用的状态、HTTP 结果、错误信息都会记录在这里。
+.create-merge table chemical_traceability_forward_audit (
+    plc_id:string,
+    forward_target:string,
+    attempt_time:datetime,
+    batch_id:string,
+    status:string,
+    http_status:string,
+    error_message:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    rows_in_batch:int,
+    source_topic:string,
+    workcenter:string,
+    report_post:string
+)
+
+// fn_chemical_traceability_materialize：把 raw_chemical_traceability_eh 中的原始报文解析成接口需要的标准字段。
+// update policy 会调用它，把结果落到 chemical_traceability_std。
+.create-or-alter function with (folder = "chemical_traceability/materialize", docstring = "Chemical traceability rows normalized from Event Hub raw records into fixed interface payload fields") fn_chemical_traceability_materialize() {
+    raw_chemical_traceability_eh
+    | where topic in (
+        "SGH/8PAA/Chem/Track/C02",
+        "SGH/8PAA/Chem/Track/C03",
+        "SGH/8PAA/Chem/Track/C05",
+        "SGH/8PAA/Chem/Track/C07",
+        "SGH/8PAA/Chem/Track/C09"
+    )
+    | extend
+        adx_ingest_time = ingestion_time(),
+        emqx_source_time = iff(isnotnull(emqx_ts), unixtime_milliseconds_todatetime(tolong(emqx_ts)), datetime(null)),
+        workcenter = trim(@" ", tostring(payload.workcenter)),
+        station = trim(@" ", tostring(payload.station)),
+        dmc_code = trim(@" ", tostring(payload.dmc_code))
+    | extend
+        payload_timestamp_text = trim(@" ", tostring(payload.timestamp))
+    | extend
+        payload_timestamp = todatetime(payload_timestamp_text)
+    | extend
+        // 所有取数与 watermark 推进都统一基于 UTC 时间，避免 blob 与表时间口径不一致。
+        source_time = coalesce(payload_timestamp, emqx_source_time, enqueued_time, adx_ingest_time)
+    | extend
+        source_message_id = iff(
+            isnotempty(message_id),
+            message_id,
+            hash_md5(strcat(
+                coalesce(topic, ""),
+                "|",
+                coalesce(tostring(source_time), ""),
+                "|",
+                coalesce(workcenter, ""),
+                "|",
+                coalesce(station, ""),
+                "|",
+                coalesce(dmc_code, "")
+            ))
+        )
+    | extend
+        plc_id = hash_md5(strcat(
+            coalesce(workcenter, ""),
+            "|",
+            coalesce(station, ""),
+            "|",
+            coalesce(tostring(source_time), ""),
+            "|",
+            coalesce(dmc_code, "")
+        )),
+        report_post = station,
+        raw_watermark_time_utc = coalesce(source_time, adx_ingest_time)
+    | extend
+        watermark_time_utc = case(
+            isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                coalesce(emqx_source_time, enqueued_time, adx_ingest_time, raw_watermark_time_utc),
+            isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                coalesce(emqx_source_time, enqueued_time, adx_ingest_time, raw_watermark_time_utc),
+            raw_watermark_time_utc
+        )
+    | extend
+        watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null)),
+        // data_time 保持原始时间语义，但输出仍使用客户已验证通过的 yyyy-MM-dd HH:mm:ss 格式。
+        data_time = iff(
+            isnotnull(payload_timestamp),
+            format_datetime(payload_timestamp, "yyyy-MM-dd HH:mm:ss"),
+            iff(isnotnull(source_time), format_datetime(source_time, "yyyy-MM-dd HH:mm:ss"), "")
+        )
+    | project
+        plc_id,
+        dmc_code,
+        data_time,
+        report_post,
+        workcenter,
+        station,
+        source_topic = topic,
+        source_message_id,
+        source_time,
+        adx_ingest_time,
+        watermark_time_utc,
+        watermark_time_local,
+        raw_payload = payload
+}
+
+// chemical_traceability_std update policy：把 raw_chemical_traceability_eh 的新消息自动清洗后写入 chemical_traceability_std。
+// 也就是 raw 表是源，fn_chemical_traceability_materialize() 是清洗逻辑，chemical_traceability_std 是落地结果。
+.alter table chemical_traceability_std policy update @'[{"IsEnabled": true, "Source": "raw_chemical_traceability_eh", "Query": "fn_chemical_traceability_materialize()", "IsTransactional": false, "PropagateIngestionProperties": true}]'
+
+// fn_chemical_traceability_forward_candidates：化学品追溯接口的发送候选函数。
+// Function 会传入 watermark、overlap 和 forward_target；它从 chemical_traceability_std 取增量数据，并结合 chemical_traceability_forward_success 去重后输出待发送行。
+.create-or-alter function with (folder = "chemical_traceability/forward", docstring = "Chemical traceability forward candidates with watermark overlap and success-ledger deduplication") fn_chemical_traceability_forward_candidates(watermark:datetime, overlap_minutes:long, success_lookback_hours:long, p_forward_target:string) {
+    let effective_start = watermark - totimespan(strcat(tostring(overlap_minutes), "m"));
+    let succeeded =
+        chemical_traceability_forward_success
+        | where forward_target == p_forward_target
+        | where ack_time > ago(totimespan(strcat(tostring(success_lookback_hours), "h")))
+        | summarize arg_max(ack_time, *) by plc_id
+        | project plc_id;
+    chemical_traceability_std
+    | where watermark_time_utc > effective_start
+    | where watermark_time_utc between (datetime(2020-01-01) .. now() + 1d)
+    | summarize arg_max(watermark_time_utc, *) by plc_id
+    | join kind = leftanti succeeded on plc_id
+    | order by watermark_time_utc asc, plc_id asc
+}

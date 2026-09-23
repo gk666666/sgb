@@ -1,0 +1,473 @@
+// 玻璃主数据链路单独维护，避免和缺陷正式表脚本混在一起。
+//
+// 当前版本按“方案 B”实现真正的一条 raw 一条主数据：
+// 1) 来源仍然是 raw_defect_eh，经各 family 的 from-raw 标准化函数进入主数据链；
+// 2) 先按 source_topic + source_message_id 收敛成消息级单条结果，再做 RFID 前 28 位补键；
+// 3) 玻璃主数据表不携带 defect_code / defect_name / defect_nine_grid / defect_surface；
+// 4) 有缺陷按有缺陷分支的时间/岗位逻辑，无缺陷按无缺陷分支的时间/岗位逻辑；
+// 5) 不再把一条 raw 拆开的多条候选记录当成多条主数据去选代表行。
+//
+// 对象说明：
+// - table glass_master：主数据正式表，一条 raw 消息最终只保留一条主数据结果。
+// - table glass_master_forward_success：主数据接口发送成功台账，用于去重和追溯。
+// - table glass_master_forward_audit：主数据接口发送审计台账，用于记录成功/失败详情。
+// - function fn_glass_master_message_base()：主数据消息级底座，先把缺陷链结果收敛成“一条 raw 一行”。
+// - function fn_glass_master_materialize()：主数据正式物化函数，负责补业务键并输出 glass_master。
+// - policy glass_master update policy：把 raw_defect_eh 的新数据自动物化到 glass_master。
+// - function fn_glass_master_forward_candidates(...)：按 watermark + success ledger 产出待发送候选。
+
+// glass_master：玻璃主数据正式表，一条 raw 消息最终只对应一条主数据结果。
+// Function 端发送主数据接口时，就是从这张表按 watermark 取候选。
+.create-merge table glass_master (
+    master_id:string,
+    factory:string,
+    dmc_code:string,
+    rfid:string,
+    aura_code:string,
+    pdlc_code:string,
+    lig_code:string,
+    bracket_rfid_code:string,
+    primer_code:string,
+    glass_id:int,
+    model_id:int,
+    mest_result:string,
+    status:string,
+    defect_report_time:datetime,
+    defect_report_time_source:string,
+    defect_report_post:string,
+    record_role:string,
+    has_defect:bool,
+    payload_family:string,
+    source_time:datetime,
+    effective_source_time:datetime,
+    adx_ingest_time:datetime,
+    source_topic:string,
+    source_message_id:string,
+    rfid_prefix28:string,
+    ws3_timestamp:string,
+    ws3_bottle1_code:string,
+    ws3_bottle2_code:string,
+    ws3_bottle3_code:string,
+    ws3_temp:string,
+    ws3_humidity:string,
+    ws3_inspec_rfid_write:string,
+    ws3_mold_up_zone01:int,
+    ws3_mold_up_zone02:int,
+    ws3_mold_down_zone01:int,
+    ws3_mold_down_zone02:int,
+    entry_time:string,
+    milling_endtime:string,
+    process_st_milling:string,
+    process_st_heat:string,
+    process_st_priming:string,
+    process_heat_temp:string,
+    priming_code01:string,
+    priming_code02:string,
+    priming_code03:string,
+    priming_code04:string,
+    status_normalized:string,
+    defect_report_time_local:datetime,
+    watermark_time_utc:datetime,
+    watermark_time_local:datetime
+)
+
+// glass_master_forward_success：主数据接口发送成功台账。
+// fn_glass_master_forward_candidates 会读取它，对最近成功发送过的 master_id 做去重。
+.create-merge table glass_master_forward_success (
+    master_id:string,
+    forward_target:string,
+    ack_time:datetime,
+    batch_id:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    payload_family:string,
+    factory:string
+)
+
+// glass_master_forward_audit：主数据接口发送审计台账。
+// Function 每次调用接口的成功/失败、批次号、错误信息都会写到这里。
+.create-merge table glass_master_forward_audit (
+    master_id:string,
+    forward_target:string,
+    attempt_time:datetime,
+    batch_id:string,
+    status:string,
+    http_status:string,
+    error_message:string,
+    watermark_before:string,
+    watermark_after:string,
+    function_instance_id:string,
+    rows_in_batch:int,
+    payload_family:string,
+    factory:string
+)
+
+// fn_glass_master_message_base：主数据消息级底座函数。
+// 它读取 fn_defect_std_union_v1，把缺陷标准化结果先收敛成“一条 raw 消息一行”的主数据候选，为后续补键做准备。
+.create-or-alter function with (folder = "glass_master/materialize", docstring = "Glass master base rows with one-row-per-raw-message semantics before RFID28 business-key backfill") fn_glass_master_message_base() {
+    let raw_rows =
+        fn_defect_std_union_v1()
+        | extend
+            source_message_id_resolved = iff(
+                isnotempty(source_message_id),
+                source_message_id,
+                hash_md5(strcat(
+                    coalesce(source_topic, ""),
+                    "|",
+                    coalesce(tostring(source_time), ""),
+                    "|",
+                    coalesce(tostring(adx_ingest_time), ""),
+                    "|",
+                    coalesce(rfid, ""),
+                    "|",
+                    coalesce(dmc_code, "")
+                ))
+            )
+        | extend
+            master_id = hash_md5(strcat(coalesce(source_topic, ""), "|", source_message_id_resolved)),
+            common_selection_time = coalesce(source_time, adx_ingest_time, effective_source_time, defect_report_time, datetime(1900-01-01)),
+            branch_selection_time = coalesce(defect_report_time, effective_source_time, source_time, adx_ingest_time, datetime(1900-01-01))
+        | extend
+            common_selection_rank = strcat(
+                iff(isnotempty(rfid), "1", "0"),
+                iff(isnotempty(dmc_code), "1", "0"),
+                iff(isnotempty(aura_code), "1", "0"),
+                iff(isnotempty(pdlc_code), "1", "0"),
+                "|",
+                format_datetime(common_selection_time, "yyyy-MM-dd HH:mm:ss.fffffff")
+            ),
+            branch_selection_rank = strcat(
+                format_datetime(branch_selection_time, "yyyy-MM-dd HH:mm:ss.fffffff"),
+                "|",
+                coalesce(defect_report_post, ""),
+                "|",
+                coalesce(record_role, "")
+            );
+    let message_common =
+        raw_rows
+        | summarize arg_max(
+            common_selection_rank,
+            factory,
+            dmc_code,
+            rfid,
+            aura_code,
+            pdlc_code,
+            lig_code,
+            bracket_rfid_code,
+            primer_code,
+            glass_id,
+            model_id,
+            mest_result,
+            status,
+            payload_family,
+            source_time,
+            adx_ingest_time,
+            source_topic,
+            source_message_id_resolved,
+            rfid_prefix28,
+            ws3_timestamp,
+            ws3_bottle1_code,
+            ws3_bottle2_code,
+            ws3_bottle3_code,
+            ws3_temp,
+            ws3_humidity,
+            ws3_inspec_rfid_write,
+            ws3_mold_up_zone01,
+            ws3_mold_up_zone02,
+            ws3_mold_down_zone01,
+            ws3_mold_down_zone02,
+            entry_time,
+            milling_endtime,
+            process_st_milling,
+            process_st_heat,
+            process_st_priming,
+            process_heat_temp,
+            priming_code01,
+            priming_code02,
+            priming_code03,
+            priming_code04
+        ) by master_id;
+    let final_branch =
+        raw_rows
+        | summarize has_defect_final = max(toint(has_defect)) by master_id;
+    let defect_branch =
+        raw_rows
+        | where has_defect == true
+        | summarize arg_max(
+            branch_selection_rank,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            record_role,
+            effective_source_time
+        ) by master_id
+        | project
+            master_id,
+            defect_branch_time = defect_report_time,
+            defect_branch_time_source = defect_report_time_source,
+            defect_branch_post = defect_report_post,
+            defect_branch_role = record_role,
+            defect_branch_effective_source_time = effective_source_time;
+    let no_defect_branch =
+        raw_rows
+        | where has_defect == false
+        | summarize arg_max(
+            branch_selection_rank,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            record_role,
+            effective_source_time
+        ) by master_id
+        | project
+            master_id,
+            no_defect_branch_time = defect_report_time,
+            no_defect_branch_time_source = defect_report_time_source,
+            no_defect_branch_post = defect_report_post,
+            no_defect_branch_role = record_role,
+            no_defect_branch_effective_source_time = effective_source_time;
+    message_common
+    | join kind = inner final_branch on master_id
+    | join kind = leftouter defect_branch on master_id
+    | join kind = leftouter no_defect_branch on master_id
+    | extend
+        has_defect = has_defect_final == 1
+    | extend
+        defect_report_time = iff(has_defect, defect_branch_time, no_defect_branch_time),
+        defect_report_time_source = iff(has_defect, defect_branch_time_source, no_defect_branch_time_source),
+        defect_report_post = iff(has_defect, defect_branch_post, no_defect_branch_post),
+        record_role = iff(has_defect, defect_branch_role, no_defect_branch_role),
+        effective_source_time = iff(has_defect, defect_branch_effective_source_time, no_defect_branch_effective_source_time)
+    | project
+        master_id,
+        factory,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        glass_id,
+        model_id,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id = source_message_id_resolved,
+        rfid_prefix28,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04
+}
+
+// fn_glass_master_materialize：主数据正式物化函数。
+// 它在 fn_glass_master_message_base 的结果上做 RFID28 历史补键，最终输出到 glass_master。
+.create-or-alter function with (folder = "glass_master/materialize", docstring = "Glass master result materialized from the raw defect stream with message-level RFID28 business-key backfill and one-row-per-raw-message semantics") fn_glass_master_materialize() {
+    let base =
+        fn_glass_master_message_base()
+        | extend candidate_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time);
+    let needs_backfill =
+        base
+        | where (factory startswith "8PA1" or factory startswith "WS3")
+        | where isnotempty(rfid_prefix28)
+        | where isempty(dmc_code) or isempty(aura_code) or isempty(pdlc_code);
+    let dmc_history_hits =
+        needs_backfill
+        | project master_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            base
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(dmc_code)
+            | project
+                history_master_id = master_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_dmc_code = dmc_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_master_id != master_id)
+        | summarize arg_max(history_event_time, history_dmc_code) by master_id
+        | project master_id, dmc_history_event_time = history_event_time, history_dmc_code;
+    let aura_history_hits =
+        needs_backfill
+        | project master_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            base
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(aura_code)
+            | project
+                history_master_id = master_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_aura_code = aura_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_master_id != master_id)
+        | summarize arg_max(history_event_time, history_aura_code) by master_id
+        | project master_id, aura_history_event_time = history_event_time, history_aura_code;
+    let pdlc_history_hits =
+        needs_backfill
+        | project master_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            base
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(pdlc_code)
+            | project
+                history_master_id = master_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_pdlc_code = pdlc_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_master_id != master_id)
+        | summarize arg_max(history_event_time, history_pdlc_code) by master_id
+        | project master_id, pdlc_history_event_time = history_event_time, history_pdlc_code;
+    base
+    | join kind = leftouter dmc_history_hits on master_id
+    | join kind = leftouter aura_history_hits on master_id
+    | join kind = leftouter pdlc_history_hits on master_id
+    | extend
+        dmc_code = coalesce(dmc_code, history_dmc_code),
+        aura_code = coalesce(aura_code, history_aura_code),
+        pdlc_code = coalesce(pdlc_code, history_pdlc_code)
+    | extend
+        defect_report_time_local = iff(isnotnull(defect_report_time), datetime_utc_to_local(defect_report_time, "Asia/Shanghai"), datetime(null)),
+        raw_watermark_time_utc = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+    | extend
+        watermark_time_utc = case(
+            isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            raw_watermark_time_utc
+        ),
+        status_normalized = case(
+            toupper(trim(@" ", tostring(status))) == "NG", "ng",
+            toupper(trim(@" ", tostring(status))) == "RW", "reworkable",
+            toupper(trim(@" ", tostring(status))) in ("M1", "M2", "OK"), "",
+            ""
+        )
+    | extend
+        watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null))
+    | project-away
+        candidate_event_time,
+        dmc_history_event_time,
+        aura_history_event_time,
+        pdlc_history_event_time,
+        history_dmc_code,
+        history_aura_code,
+        history_pdlc_code
+    | project
+        master_id,
+        factory,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        glass_id,
+        model_id,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id,
+        rfid_prefix28,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04,
+        status_normalized,
+        defect_report_time_local,
+        watermark_time_utc,
+        watermark_time_local
+}
+
+// glass_master update policy：把 raw_defect_eh 新进来的原始缺陷消息自动物化到 glass_master。
+// 也就是说，raw_defect_eh 是源表，fn_glass_master_materialize() 是中间计算逻辑，glass_master 是落地结果表。
+.alter table glass_master policy update @'[{"IsEnabled": true, "Source": "raw_defect_eh", "Query": "fn_glass_master_materialize()", "IsTransactional": false, "PropagateIngestionProperties": true}]'
+
+// fn_glass_master_forward_candidates：主数据接口的发送候选函数。
+// Function 会传入 watermark、overlap 和 forward_target；它从 glass_master 取增量数据，并结合 glass_master_forward_success 去重后输出待发送行。
+.create-or-alter function with (folder = "glass_master/forward", docstring = "Glass master forward candidates with watermark overlap and success-ledger deduplication") fn_glass_master_forward_candidates(watermark:datetime, overlap_minutes:long, success_lookback_hours:long, p_forward_target:string) {
+    let effective_start = watermark - totimespan(strcat(tostring(overlap_minutes), "m"));
+    let succeeded =
+        glass_master_forward_success
+        | where forward_target == p_forward_target
+        | where ack_time > ago(totimespan(strcat(tostring(success_lookback_hours), "h")))
+        | summarize arg_max(ack_time, *) by master_id
+        | project master_id;
+    glass_master
+    | extend
+        raw_watermark_time_utc = coalesce(watermark_time_utc, effective_source_time, source_time, defect_report_time, adx_ingest_time)
+    | extend
+        watermark_time_utc = case(
+            isnotnull(raw_watermark_time_utc) and isnotnull(adx_ingest_time) and raw_watermark_time_utc > adx_ingest_time + 2h,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            isnotnull(raw_watermark_time_utc) and raw_watermark_time_utc > now() + 5m,
+                coalesce(source_time, adx_ingest_time, raw_watermark_time_utc),
+            raw_watermark_time_utc
+        )
+    | extend
+        watermark_time_local = iff(isnotnull(watermark_time_utc), datetime_utc_to_local(watermark_time_utc, "Asia/Shanghai"), datetime(null))
+    | where watermark_time_utc > effective_start
+    | where watermark_time_utc between (datetime(2020-01-01) .. now() + 1d)
+    | summarize arg_max(watermark_time_utc, *) by master_id
+    | join kind = leftanti succeeded on master_id
+    | order by watermark_time_utc asc, master_id asc
+}

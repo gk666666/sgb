@@ -1,0 +1,29 @@
+// 缺陷 raw 入湖脚本。
+//
+// 这是缺陷链最底层的物理入口，只负责把 Event Hub / EMQX 原始消息接进 ADX，
+// 不在这里做业务解析、回填或去重。
+//
+// 当前缺陷链最关键的时间字段是 emqx_ts：
+// - 业务时间优先取 emqx_ts
+// - enqueued_time 只作为兜底
+//
+// Run in database: iotdbsekdb01prd
+//
+// 对象说明：
+// - table raw_defect_eh：缺陷原始入湖表，保存 EMQX / Event Hub 原始包。
+// - mapping raw_defect_eh_json：raw_defect_eh 的 JSON ingestion mapping。
+
+// raw_defect_eh：缺陷链的原始入湖表，只保存 Event Hub/EMQX 原始消息。
+// 下游 fn_defect_*_raw_v1 系列函数直接从这张表按 topic 切分 family 原始数据。
+.create-merge table raw_defect_eh (
+    enqueued_time: datetime,
+    emqx_ts: long,
+    topic: string,
+    device_name: string,
+    message_id: string,
+    payload: dynamic
+)
+
+// raw_defect_eh_json：raw_defect_eh 的 JSON ingestion mapping。
+// Event Hub Data Connection 用这个 mapping 把消息字段落到 raw_defect_eh 的各列。
+.create-or-alter table raw_defect_eh ingestion json mapping "raw_defect_eh_json" '[{"column":"enqueued_time","path":"$.enqueued_time","datatype":"datetime"},{"column":"emqx_ts","path":"$.emqx_ts","datatype":"long"},{"column":"topic","path":"$.topic","datatype":"string"},{"column":"device_name","path":"$.device_name","datatype":"string"},{"column":"message_id","path":"$.message_id","datatype":"string"},{"column":"payload","path":"$.payload","datatype":"dynamic"}]'

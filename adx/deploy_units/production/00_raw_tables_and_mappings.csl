@@ -1,0 +1,27 @@
+// 产量 raw 入湖脚本。
+//
+// 这是产量链最底层入口，只负责把 EMQX / Event Hub 原始计数消息接进 ADX。
+// 后续 topic 过滤、分钟重建、Tellus 候选都不在这里做。
+//
+// 当前产量业务时间优先取 source_time_ms，
+// enqueued_time 只在缺少业务时间时作为兜底之一。
+//
+// 对象说明：
+// - table raw_ops_eh：产量原始入湖表。
+// - mapping raw_ops_eh_json：raw_ops_eh 的 JSON ingestion mapping。
+
+// raw_ops_eh：产量链的原始入湖表，存放 EMQX/Event Hub 过来的计数与配方变更原始消息。
+// 下游 fn_prod_output_counter_raw_v1 和 fn_prod_recipe_change_raw_v1 都直接从这张表取数。
+.create-merge table raw_ops_eh (
+    enqueued_time: datetime,
+    source_time_ms: long,
+    topic: string,
+    device_name: string,
+    message_id: string,
+    point_value: real,
+    payload: dynamic
+)
+
+// raw_ops_eh_json：raw_ops_eh 的 JSON ingestion mapping。
+// Event Hub Data Connection 用这个 mapping 把原始消息字段落到产量 raw 表。
+.create-or-alter table raw_ops_eh ingestion json mapping "raw_ops_eh_json" '[{"column":"enqueued_time","path":"$.enqueued_time","datatype":"datetime"},{"column":"source_time_ms","path":"$.source_time_ms","datatype":"long"},{"column":"topic","path":"$.topic","datatype":"string"},{"column":"device_name","path":"$.device_name","datatype":"string"},{"column":"message_id","path":"$.message_id","datatype":"string"},{"column":"point_value","path":"$.point_value","datatype":"real"},{"column":"payload","path":"$.payload","datatype":"dynamic"}]'

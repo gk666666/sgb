@@ -1,0 +1,1304 @@
+// 这个脚本承接“缺陷多 family 统一层”的核心逻辑。
+//
+// 作用分三块：
+// 1) 把 8PA1_EOL / 8PA1_MILLING / WS3_* 等 family 统一成同一套 schema；
+// 2) 提供 union 结果，给后续物化层直接使用；
+// 3) 提供正式链会复用的回填与等价逻辑函数。
+//
+// 当前正式物理主链最终落表在 40_runtime_materialize_and_forward.csl，
+// 但那里的物化函数依赖本文件提供的统一 schema 和基础回填语义。
+//
+// 对象说明：
+// - function fn_defect_schema_empty_v1()：统一 schema 空表底座，方便多 family union。
+// - function fn_defect_8pa1_eol_*：8PA1 EOL 标准化函数组，含全量与增量版本。
+// - function fn_defect_8pa1_milling_*：8PA1 Milling 标准化函数组，含全量与增量版本。
+// - function fn_defect_ws3_prim_*：WS3 PRIM 标准化函数组，含全量与增量版本。
+// - function fn_defect_ws3_prim_inspec_*：WS3 PRIM_INSPEC 标准化函数组，含全量与增量版本。
+// - function fn_defect_ws3_pu1_*：WS3 PU1 标准化函数组，含全量与增量版本。
+// - function fn_defect_std_union_v1 / incremental_v2：把全域 family 合并成统一缺陷明细。
+// - function fn_defect_business_key_backfill_v2 / incremental_v2：业务键补齐层。
+// - function fn_plc_defect_report_equivalent_v2 / incremental_v2：下游等价层。
+// - function fn_defect_forward_candidates_v2：发送候选视图。
+// fn_defect_schema_empty_v1：统一缺陷 schema 的空骨架函数。
+// 各 family 标准化函数在 union 前都按这个结构对齐字段，保证后续 fn_defect_std_union_v1 能直接合并。
+.create-or-alter function with (folder = "defect/std", docstring = "Empty schema helper for full-domain defect families") fn_defect_schema_empty_v1() {
+    datatable(
+        plc_id:string,
+        factory:string,
+        record_role:string,
+        has_defect:bool,
+        payload_family:string,
+        source_time:datetime,
+        effective_source_time:datetime,
+        adx_ingest_time:datetime,
+        source_topic:string,
+        source_message_id:string,
+        dmc_code:string,
+        rfid:string,
+        rfid_prefix28:string,
+        aura_code:string,
+        pdlc_code:string,
+        glass_id:int,
+        model_id:int,
+        lig_code:string,
+        bracket_rfid_code:string,
+        primer_code:string,
+        mest_result:string,
+        status:string,
+        defect_report_time:datetime,
+        defect_report_time_source:string,
+        defect_report_post:string,
+        defect_code:string,
+        defect_name:string,
+        defect_nine_grid:string,
+        defect_surface:string,
+        ws3_timestamp:string,
+        ws3_bottle1_code:string,
+        ws3_bottle2_code:string,
+        ws3_bottle3_code:string,
+        ws3_temp:string,
+        ws3_humidity:string,
+        ws3_inspec_rfid_write:string,
+        ws3_mold_up_zone01:int,
+        ws3_mold_up_zone02:int,
+        ws3_mold_down_zone01:int,
+        ws3_mold_down_zone02:int,
+        entry_time:string,
+        milling_endtime:string,
+        process_st_milling:string,
+        process_st_heat:string,
+        process_st_priming:string,
+        process_heat_temp:string,
+        priming_code01:string,
+        priming_code02:string,
+        priming_code03:string,
+        priming_code04:string
+    )[]
+}
+
+// fn_defect_8pa1_eol_std_from_raw_v1：把 8PA1 EOL 原始消息解析成统一缺陷标准结构。
+// 输入通常来自 fn_defect_8pa1_eol_raw_v1 / since 版本，输出给全量和增量 8PA1 EOL 标准化视图使用。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 EOL standardized defect rows from raw input, including nine-grid defects and no-defect evidence rows") fn_defect_8pa1_eol_std_from_raw_v1(T:(enqueued_time:datetime, emqx_ts:long, topic:string, device_name:string, message_id:string, payload:dynamic)) {
+    let base =
+        T
+        | where topic == "SGH/WS1/8PA1/Defects"
+        | extend
+            payload = todynamic(payload),
+            emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+        | extend
+            adx_ingest_time = ingestion_time()
+        | extend
+            defects = todynamic(payload.defects),
+            source_time = coalesce(emqx_event_time, adx_ingest_time),
+            payload_family = "8pa1_eol",
+            factory = "8PA1_EOL",
+            rfid = trim(@" ", tostring(payload.rfid_code)),
+            dmc_code = trim(@" ", tostring(payload.dmc_code)),
+            aura_code = trim(@" ", coalesce(tostring(payload.aura_code), tostring(payload["Aura Code"]), tostring(payload.Aura_Code))),
+            pdlc_code = trim(@" ", tostring(payload.pdlc_code)),
+            lig_code = trim(@" ", tostring(payload.lig_code)),
+            bracket_rfid_code = trim(@" ", tostring(payload.bracket_rfid_code)),
+            primer_code = trim(@" ", tostring(payload.primer_code)),
+            mest_result = trim(@" ", tostring(payload.mest_result)),
+            status = trim(@" ", tostring(payload.status)),
+            rfid_prefix28 = substring(trim(@" ", tostring(payload.rfid_code)), 0, 28),
+            entry_time = trim(@" ", tostring(payload.entry_time)),
+            milling_endtime = trim(@" ", tostring(payload.milling_endtime)),
+            process_st_milling = trim(@" ", tostring(payload.process_st_milling)),
+            process_st_heat = trim(@" ", tostring(payload.process_st_heat)),
+            process_st_priming = trim(@" ", tostring(payload.process_st_priming)),
+            process_heat_temp = trim(@" ", tostring(payload.process_heat_temp)),
+            priming_code01 = trim(@" ", tostring(payload.priming_code01)),
+            priming_code02 = trim(@" ", tostring(payload.priming_code02)),
+            priming_code03 = trim(@" ", tostring(payload.priming_code03)),
+            priming_code04 = trim(@" ", tostring(payload.priming_code04)),
+            id_seed = trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.dmc_code), tostring(payload.lig_code), tostring(payload.pdlc_code), tostring(payload.primer_code)))
+        | extend
+            defect_time_raw = trim(@" ", tostring(defects.defect_time))
+        | extend
+            defect_time_has_tz = defect_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+        | extend
+            defect_time_dt = todatetime(defect_time_raw)
+        | extend
+            defect_report_time = coalesce(
+                case(
+                    isempty(defect_time_raw), datetime(null),
+                    defect_time_has_tz, defect_time_dt,
+                    datetime_local_to_utc(defect_time_dt, "Asia/Shanghai")
+                ),
+                source_time,
+                adx_ingest_time
+            ),
+            defect_report_time_source = iff(isnotempty(tostring(defects.defect_time)), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+            defect_surface_raw = trim(@" ", tostring(defects.surface)),
+            rework_code = trim(@" ", tostring(defects.rework_code)),
+            rework_code_main = tostring(split(trim(@" ", tostring(defects.rework_code)), ".")[0]),
+            grid_values = pack_array(
+                tolong(defects.nine_grid1),
+                tolong(defects.nine_grid2),
+                tolong(defects.nine_grid3),
+                tolong(defects.nine_grid4),
+                tolong(defects.nine_grid5),
+                tolong(defects.nine_grid6),
+                tolong(defects.nine_grid7),
+                tolong(defects.nine_grid8),
+                tolong(defects.nine_grid9)
+            );
+    let grid_hits =
+        base
+        | mv-expand with_itemindex = grid_index grid_value = grid_values to typeof(long)
+        | extend grid_pos = toint(grid_index) + 1, grid_mask = tolong(coalesce(grid_value, 0))
+        | where grid_mask > 0
+        | mv-expand bit_value = dynamic([1, 2, 4, 8, 16, 32]) to typeof(long)
+        | where binary_and(grid_mask, bit_value) != 0
+        | extend
+            grid_row_index = case(grid_pos in (1, 2, 3), 0, grid_pos in (4, 5, 6), 1, 2),
+            grid_col_index = case(grid_pos in (1, 4, 7), 0, grid_pos in (2, 5, 8), 1, 2)
+        | extend
+            normalized_col_index = iff(tolower(defect_surface_raw) == "s4", 2 - grid_col_index, grid_col_index)
+        | extend
+            defect_nine_grid = strcat(case(grid_row_index == 0, "a", grid_row_index == 1, "b", "c"), tostring(normalized_col_index + 1))
+        | extend
+            defect_code = tostring(bit_value)
+        | extend
+            defect_report_post = "8PA1-99",
+            record_role = "defect",
+            has_defect = true,
+            effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+            plc_id = hash_md5(strcat(id_seed, "_", tostring(defect_report_time), "_", defect_code, "_", tostring(grid_pos)))
+        | project
+            plc_id,
+            factory,
+            record_role,
+            has_defect,
+            payload_family,
+            source_time,
+            effective_source_time,
+            adx_ingest_time,
+            source_topic = topic,
+            source_message_id = message_id,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id = int(null),
+            model_id = int(null),
+            lig_code,
+            bracket_rfid_code,
+            primer_code,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            defect_code,
+            defect_name = "",
+            defect_nine_grid,
+            defect_surface = defect_surface_raw,
+            ws3_timestamp = "",
+            ws3_bottle1_code = "",
+            ws3_bottle2_code = "",
+            ws3_bottle3_code = "",
+            ws3_temp = "",
+            ws3_humidity = "",
+            ws3_inspec_rfid_write = "",
+            ws3_mold_up_zone01 = int(null),
+            ws3_mold_up_zone02 = int(null),
+            ws3_mold_down_zone01 = int(null),
+            ws3_mold_down_zone02 = int(null),
+            entry_time,
+            milling_endtime,
+            process_st_milling,
+            process_st_heat,
+            process_st_priming,
+            process_heat_temp,
+            priming_code01,
+            priming_code02,
+            priming_code03,
+            priming_code04;
+    let no_defect_rows =
+        base
+        | extend
+            defect_code_value = iff(isnotempty(rework_code), rework_code, "")
+        | extend
+            record_role = iff(isnotempty(defect_code_value), "defect", "no_defect_evidence"),
+            has_defect = isnotempty(defect_code_value),
+            defect_report_post = iff(isempty(defect_code_value), "8PA1-98", strcat("8PA1-", rework_code_main)),
+            defect_surface = iff(isnotempty(defect_code_value), defect_surface_raw, ""),
+            effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+            plc_id = hash_md5(strcat(id_seed, "_", tostring(defect_report_time), "_", defect_code_value))
+        | join kind = leftanti (grid_hits | distinct source_message_id) on $left.message_id == $right.source_message_id
+        | project
+            plc_id,
+            factory,
+            record_role,
+            has_defect,
+            payload_family,
+            source_time,
+            effective_source_time,
+            adx_ingest_time,
+            source_topic = topic,
+            source_message_id = message_id,
+            dmc_code,
+            rfid,
+            rfid_prefix28,
+            aura_code,
+            pdlc_code,
+            glass_id = int(null),
+            model_id = int(null),
+            lig_code,
+            bracket_rfid_code,
+            primer_code,
+            mest_result,
+            status,
+            defect_report_time,
+            defect_report_time_source,
+            defect_report_post,
+            defect_code = defect_code_value,
+            defect_name = "",
+            defect_nine_grid = "",
+            defect_surface,
+            ws3_timestamp = "",
+            ws3_bottle1_code = "",
+            ws3_bottle2_code = "",
+            ws3_bottle3_code = "",
+            ws3_temp = "",
+            ws3_humidity = "",
+            ws3_inspec_rfid_write = "",
+            ws3_mold_up_zone01 = int(null),
+            ws3_mold_up_zone02 = int(null),
+            ws3_mold_down_zone01 = int(null),
+            ws3_mold_down_zone02 = int(null),
+            entry_time,
+            milling_endtime,
+            process_st_milling,
+            process_st_heat,
+            process_st_priming,
+            process_heat_temp,
+            priming_code01,
+            priming_code02,
+            priming_code03,
+            priming_code04;
+    union grid_hits, no_defect_rows
+}
+
+// fn_defect_8pa1_eol_std_v1：8PA1 EOL 的全量标准化结果视图。
+// fn_defect_std_union_v1 会把它和其他 family 的标准化结果一起并起来。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 EOL standardized defect rows, including nine-grid defects and no-defect evidence rows") fn_defect_8pa1_eol_std_v1() {
+    fn_defect_8pa1_eol_std_from_raw_v1(fn_defect_8pa1_eol_raw_v1())
+}
+
+// fn_defect_8pa1_eol_std_since_v1：8PA1 EOL 的增量标准化结果视图。
+// 主要用于增量验证、排查或未来增量物化时减少扫描范围。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 EOL standardized defect rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_8pa1_eol_std_since_v1(start_time:datetime) {
+    fn_defect_8pa1_eol_std_from_raw_v1(fn_defect_8pa1_eol_raw_since_v1(start_time))
+}
+
+// fn_defect_8pa1_milling_std_from_raw_v1：把 8PA1 Milling 原始消息解析成统一缺陷标准结构。
+// 输入来自 fn_defect_8pa1_milling_raw_v1 / since，输出给后续 Milling 标准化视图和 union 层使用。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 Milling standardized defect rows from raw input, including no-defect evidence rows") fn_defect_8pa1_milling_std_from_raw_v1(T:(enqueued_time:datetime, emqx_ts:long, topic:string, device_name:string, message_id:string, payload:dynamic)) {
+    T
+    | where topic == "SGH/WS1/8PA1_Milling/Defects"
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        source_time = coalesce(emqx_event_time, adx_ingest_time),
+        payload_family = "8pa1_milling",
+        factory = "8PA1_Milling",
+        rfid_raw = trim(@" ", coalesce(tostring(payload.rfid_code), tostring(payload.rfid))),
+        dmc_code_raw = trim(@" ", tostring(payload.dmc_code)),
+        aura_code_raw = trim(@" ", coalesce(tostring(payload.aura_code), tostring(payload["Aura Code"]), tostring(payload.Aura_Code))),
+        pdlc_code_raw = trim(@" ", tostring(payload.pdlc_code)),
+        status_raw = trim(@" ", tostring(payload.status)),
+        status_code_raw = trim(@" ", tostring(payload.status_code)),
+        status_time_raw = trim(@" ", tostring(payload.status_time)),
+        entry_time = trim(@" ", tostring(payload.entry_time)),
+        milling_endtime = trim(@" ", tostring(payload.milling_endtime)),
+        process_st_milling = trim(@" ", tostring(payload.process_st_milling)),
+        process_st_heat = trim(@" ", tostring(payload.process_st_heat)),
+        process_st_priming = trim(@" ", tostring(payload.process_st_priming)),
+        process_heat_temp = trim(@" ", tostring(payload.process_heat_temp)),
+        priming_code01 = trim(@" ", tostring(payload.priming_code01)),
+        priming_code02 = trim(@" ", tostring(payload.priming_code02)),
+        priming_code03 = trim(@" ", tostring(payload.priming_code03)),
+        priming_code04 = trim(@" ", tostring(payload.priming_code04))
+    | extend
+        rfid = iff(tolower(rfid_raw) in ("", "nan", "none", "undefined"), "", rfid_raw),
+        dmc_code = iff(tolower(dmc_code_raw) in ("", "nan", "none", "undefined"), "", dmc_code_raw),
+        aura_code = iff(tolower(aura_code_raw) in ("", "nan", "none", "undefined"), "", aura_code_raw),
+        pdlc_code = iff(tolower(pdlc_code_raw) in ("", "nan", "none", "undefined"), "", pdlc_code_raw),
+        status = iff(tolower(status_raw) in ("", "nan", "none", "undefined"), "", toupper(status_raw)),
+        status_code_clean = iff(tolower(status_code_raw) in ("", "nan", "none", "undefined"), "", status_code_raw),
+        status_time_clean = iff(tolower(status_time_raw) in ("", "nan", "none", "undefined"), "", status_time_raw)
+    | extend
+        id_seed = coalesce(rfid, dmc_code, ""),
+        status_time_dt =
+            case(
+                status_time_clean matches regex @"^\d{12}$",
+                    todatetime(strcat("20", substring(status_time_clean, 0, 2), "-", substring(status_time_clean, 2, 2), "-", substring(status_time_clean, 4, 2), " ", substring(status_time_clean, 6, 2), ":", substring(status_time_clean, 8, 2), ":", substring(status_time_clean, 10, 2))),
+                status_time_clean matches regex @"^\d{14}$",
+                    todatetime(strcat(substring(status_time_clean, 0, 4), "-", substring(status_time_clean, 4, 2), "-", substring(status_time_clean, 6, 2), " ", substring(status_time_clean, 8, 2), ":", substring(status_time_clean, 10, 2), ":", substring(status_time_clean, 12, 2))),
+                todatetime(status_time_clean)
+            )
+    | extend
+        status_time_utc =
+            case(
+                isempty(status_time_clean), datetime(null),
+                status_time_clean matches regex @"^\d{12}$" or status_time_clean matches regex @"^\d{14}$",
+                    datetime_local_to_utc(status_time_dt, "Asia/Shanghai"),
+                status_time_clean matches regex @"(Z|z|[+\-]\d{2}:\d{2})$",
+                    status_time_dt,
+                datetime_local_to_utc(status_time_dt, "Asia/Shanghai")
+            )
+    | extend
+        defect_report_time = coalesce(status_time_utc, source_time, adx_ingest_time),
+        defect_report_time_source = iff(isnotempty(status_time_clean), "payload_status_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time"))
+    | extend
+        normalized_post = replace_regex(replace_regex(status_code_clean, @"\d+$", ""), @"\.$", ""),
+        defect_code_value = iff(isnotempty(status_code_clean), status_code_clean, "")
+    | extend
+        record_role = iff(isnotempty(defect_code_value), "defect", "no_defect_evidence"),
+        has_defect = isnotempty(defect_code_value),
+        defect_report_post = iff(isnotempty(defect_code_value), normalized_post, "8PA1-2"),
+        defect_nine_grid = iff(isnotempty(defect_code_value), "b2", ""),
+        defect_surface = iff(isnotempty(defect_code_value), "s1", ""),
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(id_seed, "_", iff(isnotempty(entry_time), entry_time, tostring(defect_report_time)), "_", iff(isnotempty(defect_code_value), defect_code_value, "ND")))
+    | project
+        plc_id,
+        factory,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code,
+        pdlc_code,
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        defect_code = defect_code_value,
+        defect_name = "",
+        defect_nine_grid,
+        defect_surface,
+        ws3_timestamp = "",
+        ws3_bottle1_code = "",
+        ws3_bottle2_code = "",
+        ws3_bottle3_code = "",
+        ws3_temp = "",
+        ws3_humidity = "",
+        ws3_inspec_rfid_write = "",
+        ws3_mold_up_zone01 = int(null),
+        ws3_mold_up_zone02 = int(null),
+        ws3_mold_down_zone01 = int(null),
+        ws3_mold_down_zone02 = int(null),
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04
+}
+
+// fn_defect_8pa1_milling_std_v1：8PA1 Milling 的全量标准化结果视图。
+// fn_defect_std_union_v1 会把它并入当前正式全域标准化集合。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 Milling standardized defect rows, including no-defect evidence rows") fn_defect_8pa1_milling_std_v1() {
+    fn_defect_8pa1_milling_std_from_raw_v1(fn_defect_8pa1_milling_raw_v1())
+}
+
+// fn_defect_8pa1_milling_std_since_v1：8PA1 Milling 的增量标准化结果视图。
+// 主要用于时间窗内的验证和重算。
+.create-or-alter function with (folder = "defect/std", docstring = "8PA1 Milling standardized defect rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_8pa1_milling_std_since_v1(start_time:datetime) {
+    fn_defect_8pa1_milling_std_from_raw_v1(fn_defect_8pa1_milling_raw_since_v1(start_time))
+}
+
+// fn_defect_ws3_prim_std_v1：把 WS3 PRIM 原始记录整理成统一 schema 的无缺陷证据行。
+// 它会被 fn_defect_std_union_v1 合并进全域缺陷标准化结果。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PRIM standardized rows as no-defect evidence records") fn_defect_ws3_prim_std_v1() {
+    fn_defect_ws3_prim_raw_v1()
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_prim),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_read_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"])),
+        ws3_bottle1_code = trim(@" ", tostring(ws3.bottle1_code)),
+        ws3_bottle2_code = trim(@" ", tostring(ws3.bottle2_code)),
+        ws3_bottle3_code = trim(@" ", tostring(ws3.bottle3_code)),
+        ws3_temp = trim(@" ", tostring(ws3.temp)),
+        ws3_humidity = trim(@" ", tostring(ws3.humidity)),
+        ws3_inspec_rfid_write = trim(@" ", tostring(ws3.inspec_rfid_write))
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|", ws3_bottle1_code, "|", ws3_bottle2_code, "|", ws3_bottle3_code))
+    | project
+        plc_id,
+        factory = "WS3_PRIM",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_prim",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01 = int(null),
+        ws3_mold_up_zone02 = int(null),
+        ws3_mold_down_zone01 = int(null),
+        ws3_mold_down_zone02 = int(null),
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// fn_defect_ws3_prim_std_since_v1：WS3 PRIM 的增量标准化视图。
+// 用于按时间窗验证 WS3 PRIM 标准化结果。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PRIM standardized rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_ws3_prim_std_since_v1(start_time:datetime) {
+    fn_defect_ws3_prim_raw_since_v1(start_time)
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_prim),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_read_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"])),
+        ws3_bottle1_code = trim(@" ", tostring(ws3.bottle1_code)),
+        ws3_bottle2_code = trim(@" ", tostring(ws3.bottle2_code)),
+        ws3_bottle3_code = trim(@" ", tostring(ws3.bottle3_code)),
+        ws3_temp = trim(@" ", tostring(ws3.temp)),
+        ws3_humidity = trim(@" ", tostring(ws3.humidity)),
+        ws3_inspec_rfid_write = trim(@" ", tostring(ws3.inspec_rfid_write))
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|", ws3_bottle1_code, "|", ws3_bottle2_code, "|", ws3_bottle3_code))
+    | project
+        plc_id,
+        factory = "WS3_PRIM",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_prim",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01 = int(null),
+        ws3_mold_up_zone02 = int(null),
+        ws3_mold_down_zone01 = int(null),
+        ws3_mold_down_zone02 = int(null),
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// fn_defect_ws3_prim_inspec_std_v1：把 WS3 PRIM_INSPEC 原始记录整理成统一 schema 的无缺陷证据行。
+// 它与其他 family 一起进入 fn_defect_std_union_v1。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PRIM_INSPEC standardized rows as no-defect evidence records") fn_defect_ws3_prim_inspec_std_v1() {
+    fn_defect_ws3_prim_inspec_raw_v1()
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_prim_inspec),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_read_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"]))
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|WS3_PRIM_INSPEC"))
+    | project
+        plc_id,
+        factory = "WS3_PRIM_INSPEC",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_prim_inspec",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code = "",
+        ws3_bottle2_code = "",
+        ws3_bottle3_code = "",
+        ws3_temp = "",
+        ws3_humidity = "",
+        ws3_inspec_rfid_write = "",
+        ws3_mold_up_zone01 = int(null),
+        ws3_mold_up_zone02 = int(null),
+        ws3_mold_down_zone01 = int(null),
+        ws3_mold_down_zone02 = int(null),
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// fn_defect_ws3_prim_inspec_std_since_v1：WS3 PRIM_INSPEC 的增量标准化视图。
+// 用于局部时间窗内验证或补算。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PRIM_INSPEC standardized rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_ws3_prim_inspec_std_since_v1(start_time:datetime) {
+    fn_defect_ws3_prim_inspec_raw_since_v1(start_time)
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_prim_inspec),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_read_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"]))
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|WS3_PRIM_INSPEC"))
+    | project
+        plc_id,
+        factory = "WS3_PRIM_INSPEC",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_prim_inspec",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code = "",
+        ws3_bottle2_code = "",
+        ws3_bottle3_code = "",
+        ws3_temp = "",
+        ws3_humidity = "",
+        ws3_inspec_rfid_write = "",
+        ws3_mold_up_zone01 = int(null),
+        ws3_mold_up_zone02 = int(null),
+        ws3_mold_down_zone01 = int(null),
+        ws3_mold_down_zone02 = int(null),
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// fn_defect_ws3_pu1_std_v1：把 WS3 PU1 原始记录整理成统一 schema 的无缺陷证据行。
+// 它会被并入当前正式全域缺陷标准化结果。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PU1 standardized rows as no-defect evidence records") fn_defect_ws3_pu1_std_v1() {
+    fn_defect_ws3_pu1_raw_v1()
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_pu1),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"])),
+        ws3_temp = trim(@" ", tostring(ws3.temp)),
+        ws3_humidity = trim(@" ", tostring(ws3.humidity)),
+        ws3_mold_up_zone01 = toint(ws3.mold_up_zone01),
+        ws3_mold_up_zone02 = toint(ws3.mold_up_zone02),
+        ws3_mold_down_zone01 = toint(ws3.mold_down_zone01),
+        ws3_mold_down_zone02 = toint(ws3.mold_down_zone02)
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|", ws3_temp, "|", ws3_humidity, "|", tostring(ws3_mold_up_zone01), "|", tostring(ws3_mold_up_zone02), "|", tostring(ws3_mold_down_zone01), "|", tostring(ws3_mold_down_zone02)))
+    | project
+        plc_id,
+        factory = "WS3_PU1",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_pu1",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "8PU1-1",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code = "",
+        ws3_bottle2_code = "",
+        ws3_bottle3_code = "",
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write = "",
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// fn_defect_ws3_pu1_std_since_v1：WS3 PU1 的增量标准化视图。
+// 用于局部时间窗核对或未来增量物化。
+.create-or-alter function with (folder = "defect/std", docstring = "WS3 PU1 standardized rows since start_time, with raw filtering pushed down to the raw layer") fn_defect_ws3_pu1_std_since_v1(start_time:datetime) {
+    fn_defect_ws3_pu1_raw_since_v1(start_time)
+    | extend
+        payload = todynamic(payload),
+        emqx_event_time = unixtime_milliseconds_todatetime(emqx_ts)
+    | extend
+        adx_ingest_time = ingestion_time()
+    | extend
+        ws3 = todynamic(payload.ws3_pu1),
+        source_time = coalesce(emqx_event_time, adx_ingest_time)
+    | extend
+        ws3_time_raw = trim(@" ", tostring(ws3["time"]))
+    | extend
+        ws3_time_has_tz = ws3_time_raw matches regex @"(Z|z|[+\-]\d{2}:\d{2})$"
+    | extend
+        ws3_time_dt = todatetime(ws3_time_raw)
+    | extend
+        defect_report_time = coalesce(
+            case(
+                isempty(ws3_time_raw), datetime(null),
+                ws3_time_has_tz, ws3_time_dt,
+                datetime_local_to_utc(ws3_time_dt, "Asia/Shanghai")
+            ),
+            source_time,
+            adx_ingest_time
+        ),
+        defect_report_time_source = iff(isnotempty(tostring(ws3["time"])), "payload_report_time", iff(isnotnull(emqx_event_time), "emqx_ts", "adx_ingest_time")),
+        rfid = trim(@" ", tostring(ws3.rfid_write)),
+        ws3_timestamp = trim(@" ", tostring(ws3["time"])),
+        ws3_temp = trim(@" ", tostring(ws3.temp)),
+        ws3_humidity = trim(@" ", tostring(ws3.humidity)),
+        ws3_mold_up_zone01 = toint(ws3.mold_up_zone01),
+        ws3_mold_up_zone02 = toint(ws3.mold_up_zone02),
+        ws3_mold_down_zone01 = toint(ws3.mold_down_zone01),
+        ws3_mold_down_zone02 = toint(ws3.mold_down_zone02)
+    | extend
+        effective_source_time = coalesce(defect_report_time, source_time, adx_ingest_time),
+        plc_id = hash_md5(strcat(rfid, "|", tostring(defect_report_time), "|", ws3_temp, "|", ws3_humidity, "|", tostring(ws3_mold_up_zone01), "|", tostring(ws3_mold_up_zone02), "|", tostring(ws3_mold_down_zone01), "|", tostring(ws3_mold_down_zone02)))
+    | project
+        plc_id,
+        factory = "WS3_PU1",
+        record_role = "no_defect_evidence",
+        has_defect = false,
+        payload_family = "ws3_pu1",
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic = topic,
+        source_message_id = message_id,
+        dmc_code = "",
+        rfid,
+        rfid_prefix28 = substring(rfid, 0, 28),
+        aura_code = "",
+        pdlc_code = "",
+        glass_id = int(null),
+        model_id = int(null),
+        lig_code = "",
+        bracket_rfid_code = "",
+        primer_code = "",
+        mest_result = "",
+        status = "",
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post = "8PU1-1",
+        defect_code = "",
+        defect_name = "",
+        defect_nine_grid = "",
+        defect_surface = "",
+        ws3_timestamp,
+        ws3_bottle1_code = "",
+        ws3_bottle2_code = "",
+        ws3_bottle3_code = "",
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write = "",
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time = "",
+        milling_endtime = "",
+        process_st_milling = "",
+        process_st_heat = "",
+        process_st_priming = "",
+        process_heat_temp = "",
+        priming_code01 = "",
+        priming_code02 = "",
+        priming_code03 = "",
+        priming_code04 = ""
+}
+
+// 把全部已接入缺陷 family 合并成一张统一长表。
+// 后续不管是旧版函数视图，还是 v2 物化表，都会基于这个 union 结果继续处理。
+// fn_defect_std_union_v1：把所有已接入的缺陷 family 标准化结果合并成一套统一 schema。
+// fn_defect_std_all_v2_materialize_v1 和主数据函数 fn_glass_master_message_base 都直接依赖它。
+.create-or-alter function with (folder = "defect/std", docstring = "Union of all defect families into a unified schema") fn_defect_std_union_v1() {
+    union
+        fn_defect_final_std_v1(),
+        fn_defect_8pa1_eol_std_v1(),
+        fn_defect_8pa1_milling_std_v1(),
+        fn_defect_ws3_prim_std_v1(),
+        fn_defect_ws3_prim_inspec_std_v1(),
+        fn_defect_ws3_pu1_std_v1()
+}
+
+// 增量版 union，把时间过滤尽量前推到 raw 层，主要用于降低全量重算时的内存压力。
+// fn_defect_std_union_incremental_v2：全域缺陷标准化结果的增量 union 视图。
+// 用于在较小时间窗里验证统一结果，减少全表扫描。
+.create-or-alter function with (folder = "defect/std", docstring = "Union of all defect families into a unified schema since start_time, with raw filtering pushed down to the raw layer") fn_defect_std_union_incremental_v2(start_time:datetime) {
+    union
+        fn_defect_final_std_since_v1(start_time),
+        fn_defect_8pa1_eol_std_since_v1(start_time),
+        fn_defect_8pa1_milling_std_since_v1(start_time),
+        fn_defect_ws3_prim_std_since_v1(start_time),
+        fn_defect_ws3_prim_inspec_std_since_v1(start_time),
+        fn_defect_ws3_pu1_std_since_v1(start_time)
+}
+
+// v2 回填层对齐老 Python 缺陷语义：
+// 1) 只对 8PA1 / WS3 等需要补业务键的记录生效；
+// 2) 按 rfid_prefix28 关联历史；
+// 3) 只允许更早历史补当前；
+// 4) dmc / aura / pdlc 分字段独立回填；
+// 5) 只补空值，不覆盖当前已有字段。
+// fn_defect_business_key_backfill_v2：缺陷业务键回填 v2。
+// 它按 RFID 前 28 位和历史时间顺序补 dmc/aura/pdlc，是正式 equivalent_v2 逻辑的重要基础。
+.create-or-alter function with (folder = "defect/business", docstring = "Business-key backfill v2 aligned with the legacy Python defect path: backfill only from prior defect history by RFID prefix28 and point-in-time ordering") fn_defect_business_key_backfill_v2() {
+    let base =
+        fn_defect_std_union_v1()
+        | extend candidate_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time);
+    let needs_backfill =
+        base
+        | where (factory startswith "8PA1" or factory startswith "WS3")
+        | where isnotempty(rfid_prefix28)
+        | where isempty(dmc_code) or isempty(aura_code) or isempty(pdlc_code);
+    let dmc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            fn_defect_std_union_v1()
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(dmc_code)
+            | project
+                history_plc_id = plc_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_dmc_code = dmc_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, *) by plc_id
+        | project plc_id, dmc_history_event_time = history_event_time, history_dmc_code;
+    let aura_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            fn_defect_std_union_v1()
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(aura_code)
+            | project
+                history_plc_id = plc_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_aura_code = aura_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, *) by plc_id
+        | project plc_id, aura_history_event_time = history_event_time, history_aura_code;
+    let pdlc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            fn_defect_std_union_v1()
+            | extend history_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time)
+            | where isnotempty(rfid_prefix28)
+            | where isnotempty(pdlc_code)
+            | project
+                history_plc_id = plc_id,
+                history_rfid_prefix28 = rfid_prefix28,
+                history_event_time,
+                history_pdlc_code = pdlc_code
+        ) on $left.rfid_prefix28 == $right.history_rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, *) by plc_id
+        | project plc_id, pdlc_history_event_time = history_event_time, history_pdlc_code;
+    base
+    | join kind = leftouter dmc_history_hits on plc_id
+    | join kind = leftouter aura_history_hits on plc_id
+    | join kind = leftouter pdlc_history_hits on plc_id
+    | extend
+        dmc_code = coalesce(dmc_code, history_dmc_code),
+        aura_code = coalesce(aura_code, history_aura_code),
+        pdlc_code = coalesce(pdlc_code, history_pdlc_code)
+    | project-away
+        candidate_event_time,
+        dmc_history_event_time,
+        aura_history_event_time,
+        pdlc_history_event_time,
+        history_dmc_code,
+        history_aura_code,
+        history_pdlc_code
+}
+
+// 这是基于函数视图的 equivalent v2 结果。
+// 当前正式发送主链已经改为走 40 脚本里的物理表 equivalent_v2，
+// 这里更多保留给语义验证、对照查询和历史过渡使用。
+// fn_plc_defect_report_equivalent_v2：当前正式缺陷等价视图的逻辑层。
+// defect_plc_report_equivalent_v2 这张正式结果表，本质上就是把这套逻辑再物化落表。
+.create-or-alter function with (folder = "defect/equivalent", docstring = "Equivalent view v2 that keeps full-domain family parsing and RFID28 business-key backfill semantics") fn_plc_defect_report_equivalent_v2() {
+    fn_defect_business_key_backfill_v2()
+    | project
+        plc_id,
+        factory,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        glass_id,
+        model_id,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        defect_code,
+        defect_name,
+        defect_nine_grid,
+        defect_surface,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id,
+        rfid_prefix28,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04
+}
+
+// 这是回填 v2 的增量版，只对最近窗口候选做补键，并尽量缩小历史扫描范围。
+// 主要用途是减少 portal 全量试算时的内存占用。
+// fn_defect_business_key_backfill_incremental_v2：业务键回填的增量版本。
+// 它只针对近窗候选缩小历史范围，主要用于降低验证和增量查询的内存压力。
+.create-or-alter function with (folder = "defect/business", docstring = "Incremental business-key backfill v2 for recent forward candidates only. Narrows history to relevant RFID prefix28 values to reduce query memory.") fn_defect_business_key_backfill_incremental_v2(start_time:datetime) {
+    let base =
+        fn_defect_std_union_incremental_v2(start_time)
+        | extend candidate_event_time = coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time);
+    let candidate_base =
+        materialize(
+            base
+            | where candidate_event_time > start_time
+        );
+    let needs_backfill =
+        materialize(
+            candidate_base
+            | where (factory startswith "8PA1" or factory startswith "WS3")
+            | where isnotempty(rfid_prefix28)
+            | where isempty(dmc_code) or isempty(aura_code) or isempty(pdlc_code)
+        );
+    let relevant_prefixes =
+        materialize(
+            needs_backfill
+            | summarize by rfid_prefix28
+        );
+    let history_base =
+        base
+        | where isnotempty(rfid_prefix28)
+        | join kind = inner hint.strategy=broadcast relevant_prefixes on rfid_prefix28
+        | project
+            history_plc_id = plc_id,
+            rfid_prefix28,
+            history_event_time = candidate_event_time,
+            history_dmc_code = dmc_code,
+            history_aura_code = aura_code,
+            history_pdlc_code = pdlc_code;
+    let dmc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_dmc_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_dmc_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_dmc_code) by plc_id
+        | project plc_id, dmc_history_event_time = history_event_time, history_dmc_code;
+    let aura_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_aura_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_aura_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_aura_code) by plc_id
+        | project plc_id, aura_history_event_time = history_event_time, history_aura_code;
+    let pdlc_history_hits =
+        needs_backfill
+        | project plc_id, rfid_prefix28, candidate_event_time
+        | join kind = leftouter (
+            history_base
+            | where isnotempty(history_pdlc_code)
+            | project history_plc_id, rfid_prefix28, history_event_time, history_pdlc_code
+        ) on rfid_prefix28
+        | where isnull(history_event_time) or (history_event_time <= candidate_event_time and history_plc_id != plc_id)
+        | summarize arg_max(history_event_time, history_pdlc_code) by plc_id
+        | project plc_id, pdlc_history_event_time = history_event_time, history_pdlc_code;
+    candidate_base
+    | join kind = leftouter dmc_history_hits on plc_id
+    | join kind = leftouter aura_history_hits on plc_id
+    | join kind = leftouter pdlc_history_hits on plc_id
+    | extend
+        dmc_code = coalesce(dmc_code, history_dmc_code),
+        aura_code = coalesce(aura_code, history_aura_code),
+        pdlc_code = coalesce(pdlc_code, history_pdlc_code)
+    | project-away
+        candidate_event_time,
+        dmc_history_event_time,
+        aura_history_event_time,
+        pdlc_history_event_time,
+        history_dmc_code,
+        history_aura_code,
+        history_pdlc_code
+}
+
+// fn_plc_defect_report_equivalent_incremental_v2：正式等价视图的增量版本。
+// 它结合增量业务键回填函数，只计算最近时间窗内的等价输出。
+.create-or-alter function with (folder = "defect/equivalent", docstring = "Incremental equivalent view v2 for recent forward candidates. Uses narrowed RFID28 backfill scope to reduce memory usage.") fn_plc_defect_report_equivalent_incremental_v2(start_time:datetime) {
+    fn_defect_business_key_backfill_incremental_v2(start_time)
+    | project
+        plc_id,
+        factory,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        glass_id,
+        model_id,
+        mest_result,
+        status,
+        defect_report_time,
+        defect_report_time_source,
+        defect_report_post,
+        defect_code,
+        defect_name,
+        defect_nine_grid,
+        defect_surface,
+        record_role,
+        has_defect,
+        payload_family,
+        source_time,
+        effective_source_time,
+        adx_ingest_time,
+        source_topic,
+        source_message_id,
+        rfid_prefix28,
+        ws3_timestamp,
+        ws3_bottle1_code,
+        ws3_bottle2_code,
+        ws3_bottle3_code,
+        ws3_temp,
+        ws3_humidity,
+        ws3_inspec_rfid_write,
+        ws3_mold_up_zone01,
+        ws3_mold_up_zone02,
+        ws3_mold_down_zone01,
+        ws3_mold_down_zone02,
+        entry_time,
+        milling_endtime,
+        process_st_milling,
+        process_st_heat,
+        process_st_priming,
+        process_heat_temp,
+        priming_code01,
+        priming_code02,
+        priming_code03,
+        priming_code04
+}
+
+// fn_defect_forward_candidates_v2：全域缺陷发送候选的逻辑视图。
+// 它主要用于验证全域 family 候选集合，正式上线发送仍以 scheme_b_v2 物化链为主。
+.create-or-alter function with (folder = "defect/forward", docstring = "Forward candidate view v2 for full-domain validation. Keeps all eligible rows ordered by effective event time.") fn_defect_forward_candidates_v2() {
+    fn_plc_defect_report_equivalent_v2()
+    | order by coalesce(effective_source_time, source_time, defect_report_time, adx_ingest_time) asc, plc_id asc
+}

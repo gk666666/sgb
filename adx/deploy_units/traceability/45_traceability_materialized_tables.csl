@@ -1,0 +1,427 @@
+// 追溯物化层脚本。
+//
+// 这层负责把 25_traceability_normalize_and_wide_logic.csl 中的函数视图正式落成物理对象：
+// 1) 追溯标准事件历史表：保留全历史；
+// 2) 追溯宽表当前态：保留“一块玻璃一行”的快照；
+// 3) Grafana 类查询需要的 Final / Milling 缺陷聚合表。
+//
+// 注意：
+// - traceability_normalized_events_v2 适合用 update policy 自动追加历史；
+// - traceability_wide_v2 和两张 defect agg 表属于“当前态/聚合态”，
+//   不适合直接靠 update policy 持续 append，通常应走显式刷新。
+//
+// 对象说明：
+// - table traceability_normalized_events_v2：追溯标准事件历史表。
+// - function fn_traceability_normalized_events_materialize_v1()：标准事件物化函数。
+// - policy traceability_normalized_events_v2 update policy：把 raw 新数据自动落历史表。
+// - table traceability_wide_v2：一块玻璃一行的追溯宽表当前态。
+// - function fn_traceability_wide_v2_materialize_v1()：宽表快照重算函数。
+// - table traceability_final_defect_agg_v1：Final 缺陷聚合表。
+// - function fn_traceability_final_defect_agg_materialize_v1()：Final 缺陷聚合函数。
+// - table traceability_milling_defect_agg_v1：Milling 缺陷聚合表。
+// - function fn_traceability_milling_defect_agg_materialize_v1()：Milling 缺陷聚合函数。
+// - function fn_traceability_dashboard_equivalent_v1(...)：面向 Grafana 的查询封装。
+
+// traceability_normalized_events_v2：追溯标准事件历史表，按事件粒度保存全历史。
+// raw_traceability_eh 的新消息会通过 update policy 自动清洗后追加到这张表。
+.create-merge table traceability_normalized_events_v2 (
+    glass_key:string,
+    event_time:datetime,
+    event_source:string,
+    source_topic:string,
+    source_message_id:string,
+    dmc_code:string,
+    rfid:string,
+    rfid_prefix28:string,
+    aura_code:string,
+    pdlc_code:string,
+    mest_result:string,
+    status:string,
+    lig_code:string,
+    bracket_rfid_code:string,
+    primer_code:string,
+    rack_id:string,
+    slot_id:int,
+    bottle1_code:string,
+    bottle2_code:string,
+    bottle3_code:string,
+    temp:real,
+    humidity:real
+)
+
+// 标准事件历史层：只保留统一 schema 的事件视角结果，不做宽表聚合。
+// fn_traceability_normalized_events_materialize_v1：追溯标准事件历史表的物化函数。
+// 它读取 fn_traceability_normalized_events_v1，把统一事件流投影成 traceability_normalized_events_v2 的落表字段。
+.create-or-alter function with (folder = "traceability/materialize", docstring = "Normalized traceability events materialized for historical retention") fn_traceability_normalized_events_materialize_v1() {
+    fn_traceability_normalized_events_v1()
+    | project
+        glass_key,
+        event_time,
+        event_source,
+        source_topic,
+        source_message_id,
+        dmc_code,
+        rfid,
+        rfid_prefix28,
+        aura_code,
+        pdlc_code,
+        mest_result,
+        status,
+        lig_code,
+        bracket_rfid_code,
+        primer_code,
+        rack_id,
+        slot_id,
+        bottle1_code,
+        bottle2_code,
+        bottle3_code,
+        temp,
+        humidity
+}
+
+// traceability_normalized_events_v2 update policy：把 raw_traceability_eh 新进来的追溯原始消息自动清洗后追加到历史事件表。
+// raw_traceability_eh 是源表，fn_traceability_normalized_events_materialize_v1() 是清洗逻辑，traceability_normalized_events_v2 是落地表。
+.alter table traceability_normalized_events_v2 policy update @'[{"IsEnabled": true, "Source": "raw_traceability_eh", "Query": "fn_traceability_normalized_events_materialize_v1()", "IsTransactional": false, "PropagateIngestionProperties": true}]'
+
+// traceability_wide_v2：一片玻璃一行的追溯宽表当前态。
+// 它不会通过 update policy 持续 append，而是通过显式刷新重算当前快照。
+.create-merge table traceability_wide_v2 (
+    glass_key:string,
+    dmc_code:string,
+    rfid:string,
+    aura_code:string,
+    pdlc_code:string,
+    mest_result:string,
+    status:string,
+    ws1__2cw2__time:datetime,
+    ws1__2cw2__rfid:string,
+    ws1__3fw2__time:datetime,
+    ws1__3fw2__rfid:string,
+    ws1__3fw2__mold_number:int,
+    ws1__3fw2__mold_type:int,
+    ws1__3fw2__mold_temp:int,
+    ws1__3fw2__furnace_ch1_temp:int,
+    ws1__3fw2__furnace_ch3_temp:int,
+    ws1__3fw2__furnace_ch5_temp:int,
+    ws1__4aw2__time:datetime,
+    ws1__4aw2__rfid:string,
+    ws1__5fn6__final__time:datetime,
+    ws1__5fn6__final__rfid:string,
+    ws3__prim__time:datetime,
+    ws3__prim__rfid:string,
+    ws3__prim__bottle1_code:string,
+    ws3__prim__bottle2_code:string,
+    ws3__prim__bottle3_code:string,
+    ws3__prim__temp:real,
+    ws3__prim__humidity:real,
+    ws3__prim__inspec_rfid_write:string,
+    ws3__prim_inspec__time:datetime,
+    ws3__prim_inspec__rfid:string,
+    ws3__curing__time:datetime,
+    ws3__curing__rack_id:string,
+    ws3__curing__entry_time:datetime,
+    ws3__curing__entry_rfid_read:string,
+    ws3__curing__curing_time:real,
+    ws3__curing__is_departed:int,
+    ws3__curing__departure_time:datetime,
+    ws3__curing__departure_rfid_write:string,
+    ws3__curing__write_status:int,
+    ws3__curing__write_time:datetime,
+    ws3__pu1__time:datetime,
+    ws3__pu1__rfid:string,
+    ws3__pu1__temp:real,
+    ws3__pu1__humidity:real,
+    ws3__pu1__mold_up_zone01:int,
+    ws3__pu1__mold_up_zone02:int,
+    ws3__pu1__mold_down_zone01:int,
+    ws3__pu1__mold_down_zone02:int,
+    ws1__8pa1__milling__time:datetime,
+    ws1__8pa1__milling__rfid:string,
+    ws1__8pa1__milling__manual_upload:int,
+    ws1__8pa1__milling__destination:string,
+    ws1__8pa1__eolcv__time:datetime,
+    ws1__8pa1__eolcv__rfid:string,
+    ws1__8pa1__eolcv__mest_pdlc:string,
+    ws1__8pa1__eolcv__lig_1:string,
+    ws1__8pa1__eolcv__lig_2:string,
+    ws1__8pa1__eolcv__result:string,
+    ws1__8pa1__eolcv__front_sky_holder__time:datetime,
+    ws1__8pa1__eolcv__front_sky_holder__part1_status:string,
+    ws1__8pa1__eolcv__front_sky_holder__part2_status:string,
+    ws1__8pa1__eolcv__front_sky_holder__part3_status:string,
+    ws1__8pa1__eolcv__front_sky_holder__push2_status:string,
+    ws1__8pa1__eolcv__ecu__time:datetime,
+    ws1__8pa1__eolcv__ecu__a02prussure_status:string,
+    ws1__8pa1__eolcv__led_harness__time:datetime,
+    ws1__8pa1__eolcv__led_harness__qr_code:string,
+    ws1__8pa1__eolcv__led_harness__status:string,
+    ws1__8pa1__eolcv__pdlc__time:datetime,
+    ws1__8pa1__eolcv__lig__time:datetime,
+    ws1__8pa1__eolcv__llp_primer_glass__end_time:string,
+    ws1__8pa1__eolcv__llp_primer_glass__bottle1_code:string,
+    ws1__8pa1__eolcv__llp_primer_glass__bottle2_code:string,
+    ws1__8pa1__eolcv__llp_primer_glass__bottle3_code:string,
+    ws1__8pa1__eolcv__llp_primer_glass__bottle4_code:string,
+    ws1__8pa1__eolcv__llp_primer_glass__bottle5_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__end_time:string,
+    ws1__8pa1__eolcv__llp_primer_pu__scan_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__bottle1_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__bottle2_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__bottle3_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__bottle4_code:string,
+    ws1__8pa1__eolcv__llp_primer_pu__bottle5_code:string,
+    ws1__8pa1__eolcv__eol_inspection__insp_time:datetime,
+    ws1__8pa1__eolcv__llp_rework__end_time:string,
+    ws1__8pa1__eolcv__llp_rework__scan_code:string,
+    ws1__8pa1__eolcv__llp_rework__bottle1_code:string,
+    ws1__8pa1__eolcv__llp_rework__bottle2_code:string,
+    ws1__8pa1__eolcv__llp_rework__bottle3_code:string,
+    ws1__8pa1__eolcv__llp_rework__bottle4_code:string,
+    ws1__8pa1__eolcv__llp_rework__bottle5_code:string,
+    ws1__8pa1__defects_b__time:datetime,
+    ws1__8pa1__defects_b__rfid:string,
+    ws1__8pa1__defects_b__primer_code:string,
+    ws1__8pa1__defects_b__status:string,
+    ws1__8pa1__defects_b__defects__check_time:datetime,
+    ws1__8pa1__defects_b__defects__rework_code:string,
+    ws1__8pa1__defects_b__marposs__time:datetime,
+    ws1__8pa1__defects_b__marposs__status:string,
+    ws1__8pa1__defects_b__llp_label__time:datetime,
+    ws1__8pa1__defects_b__llp_label__code:string,
+    ws1__8pa1__defects_b__unload_pack__time:datetime,
+    ws1__8pa1__defects_b__unload_pack__status:string,
+    ws1__8pa1__packing__time:datetime,
+    ws1__8pa1__packing__rack_id:string,
+    ws1__8pa1__packing__slot_id:int,
+    ws1__8pa1__curing__time:datetime,
+    ws1__8pa1__curing__rack_id:string,
+    ws1__8pa1__curing__entry_time:datetime,
+    ws1__8pa1__curing__curing_time:real,
+    ws1__8pa1__curing__is_departed:int,
+    ws1__8pa1__curing__departure_time:datetime,
+    ws1__8pa1__curing__departure_rfid_write:string,
+    ws1__8pa1__curing__write_status:int,
+    ws1__8pa1__curing__write_time:datetime
+)
+
+// 宽表当前态物化函数：把 wide equivalent v2 的结果投影成正式宽表 schema。
+// fn_traceability_wide_v2_materialize_v1：追溯宽表当前态的重算函数。
+// 它读取 fn_traceability_wide_equivalent_v2，并把逻辑视图投影成 traceability_wide_v2 的正式字段。
+.create-or-alter function with (folder = "traceability/materialize", docstring = "Traceability wide snapshot materialization function aligned to old glass_traceability_wide_table semantics") fn_traceability_wide_v2_materialize_v1() {
+    fn_traceability_wide_equivalent_v2()
+    | project
+        glass_key,
+        dmc_code,
+        rfid,
+        aura_code,
+        pdlc_code,
+        mest_result,
+        status,
+        ws1__2cw2__time,
+        ws1__2cw2__rfid,
+        ws1__3fw2__time,
+        ws1__3fw2__rfid,
+        ws1__3fw2__mold_number,
+        ws1__3fw2__mold_type,
+        ws1__3fw2__mold_temp,
+        ws1__3fw2__furnace_ch1_temp,
+        ws1__3fw2__furnace_ch3_temp,
+        ws1__3fw2__furnace_ch5_temp,
+        ws1__4aw2__time,
+        ws1__4aw2__rfid,
+        ws1__5fn6__final__time,
+        ws1__5fn6__final__rfid,
+        ws3__prim__time,
+        ws3__prim__rfid,
+        ws3__prim__bottle1_code,
+        ws3__prim__bottle2_code,
+        ws3__prim__bottle3_code,
+        ws3__prim__temp,
+        ws3__prim__humidity,
+        ws3__prim__inspec_rfid_write,
+        ws3__prim_inspec__time,
+        ws3__prim_inspec__rfid,
+        ws3__curing__time,
+        ws3__curing__rack_id,
+        ws3__curing__entry_time,
+        ws3__curing__entry_rfid_read,
+        ws3__curing__curing_time,
+        ws3__curing__is_departed,
+        ws3__curing__departure_time,
+        ws3__curing__departure_rfid_write,
+        ws3__curing__write_status,
+        ws3__curing__write_time,
+        ws3__pu1__time,
+        ws3__pu1__rfid,
+        ws3__pu1__temp,
+        ws3__pu1__humidity,
+        ws3__pu1__mold_up_zone01,
+        ws3__pu1__mold_up_zone02,
+        ws3__pu1__mold_down_zone01,
+        ws3__pu1__mold_down_zone02,
+        ws1__8pa1__milling__time,
+        ws1__8pa1__milling__rfid,
+        ws1__8pa1__milling__manual_upload,
+        ws1__8pa1__milling__destination,
+        ws1__8pa1__eolcv__time,
+        ws1__8pa1__eolcv__rfid,
+        ws1__8pa1__eolcv__mest_pdlc,
+        ws1__8pa1__eolcv__lig_1,
+        ws1__8pa1__eolcv__lig_2,
+        ws1__8pa1__eolcv__result,
+        ws1__8pa1__eolcv__front_sky_holder__time,
+        ws1__8pa1__eolcv__front_sky_holder__part1_status,
+        ws1__8pa1__eolcv__front_sky_holder__part2_status,
+        ws1__8pa1__eolcv__front_sky_holder__part3_status,
+        ws1__8pa1__eolcv__front_sky_holder__push2_status,
+        ws1__8pa1__eolcv__ecu__time,
+        ws1__8pa1__eolcv__ecu__a02prussure_status,
+        ws1__8pa1__eolcv__led_harness__time,
+        ws1__8pa1__eolcv__led_harness__qr_code,
+        ws1__8pa1__eolcv__led_harness__status,
+        ws1__8pa1__eolcv__pdlc__time,
+        ws1__8pa1__eolcv__lig__time,
+        ws1__8pa1__eolcv__llp_primer_glass__end_time,
+        ws1__8pa1__eolcv__llp_primer_glass__bottle1_code,
+        ws1__8pa1__eolcv__llp_primer_glass__bottle2_code,
+        ws1__8pa1__eolcv__llp_primer_glass__bottle3_code,
+        ws1__8pa1__eolcv__llp_primer_glass__bottle4_code,
+        ws1__8pa1__eolcv__llp_primer_glass__bottle5_code,
+        ws1__8pa1__eolcv__llp_primer_pu__end_time,
+        ws1__8pa1__eolcv__llp_primer_pu__scan_code,
+        ws1__8pa1__eolcv__llp_primer_pu__bottle1_code,
+        ws1__8pa1__eolcv__llp_primer_pu__bottle2_code,
+        ws1__8pa1__eolcv__llp_primer_pu__bottle3_code,
+        ws1__8pa1__eolcv__llp_primer_pu__bottle4_code,
+        ws1__8pa1__eolcv__llp_primer_pu__bottle5_code,
+        ws1__8pa1__eolcv__eol_inspection__insp_time,
+        ws1__8pa1__eolcv__llp_rework__end_time,
+        ws1__8pa1__eolcv__llp_rework__scan_code,
+        ws1__8pa1__eolcv__llp_rework__bottle1_code,
+        ws1__8pa1__eolcv__llp_rework__bottle2_code,
+        ws1__8pa1__eolcv__llp_rework__bottle3_code,
+        ws1__8pa1__eolcv__llp_rework__bottle4_code,
+        ws1__8pa1__eolcv__llp_rework__bottle5_code,
+        ws1__8pa1__defects_b__time,
+        ws1__8pa1__defects_b__rfid,
+        ws1__8pa1__defects_b__primer_code,
+        ws1__8pa1__defects_b__status,
+        ws1__8pa1__defects_b__defects__check_time,
+        ws1__8pa1__defects_b__defects__rework_code,
+        ws1__8pa1__defects_b__marposs__time,
+        ws1__8pa1__defects_b__marposs__status,
+        ws1__8pa1__defects_b__llp_label__time,
+        ws1__8pa1__defects_b__llp_label__code,
+        ws1__8pa1__defects_b__unload_pack__time,
+        ws1__8pa1__defects_b__unload_pack__status,
+        ws1__8pa1__packing__time,
+        ws1__8pa1__packing__rack_id,
+        ws1__8pa1__packing__slot_id,
+        ws1__8pa1__curing__time,
+        ws1__8pa1__curing__rack_id,
+        ws1__8pa1__curing__entry_time,
+        ws1__8pa1__curing__curing_time,
+        ws1__8pa1__curing__is_departed,
+        ws1__8pa1__curing__departure_time,
+        ws1__8pa1__curing__departure_rfid_write,
+        ws1__8pa1__curing__write_status,
+        ws1__8pa1__curing__write_time
+}
+
+// traceability_final_defect_agg_v1：Final 缺陷聚合表。
+// 它把同一 dmc_code 的多条 Final 缺陷记录汇总成 Grafana/报表更容易消费的聚合字段。
+.create-merge table traceability_final_defect_agg_v1 (
+    dmc_code:string,
+    status_agg:string,
+    defect_report_time_agg:string,
+    defect_code_agg:string,
+    defect_surface_agg:string,
+    defect_nine_grid_agg:string
+)
+
+// fn_traceability_final_defect_agg_materialize_v1：Final 缺陷聚合函数。
+// 它读取 defect_plc_report_equivalent_v2，并按 dmc_code 聚合 Final 缺陷相关字段。
+.create-or-alter function with (folder = "traceability/materialize", docstring = "Final defect aggregation aligned to old Grafana SQL") fn_traceability_final_defect_agg_materialize_v1() {
+    defect_plc_report_equivalent_v2
+    | where isnotempty(dmc_code)
+    | where toupper(trim(@" ", tostring(factory))) == "FINAL"
+    | extend sort_time = coalesce(defect_report_time, effective_source_time, source_time, adx_ingest_time)
+    | order by dmc_code asc, sort_time asc
+    | summarize
+        status_list = make_list(coalesce(status, "")),
+        defect_report_time_list = make_list(iff(isnull(defect_report_time), "", format_datetime(defect_report_time, "yyyy-MM-dd HH:mm:ss"))),
+        defect_code_list = make_list(coalesce(defect_code, "")),
+        defect_surface_list = make_list(coalesce(defect_surface, "")),
+        defect_nine_grid_list = make_list(coalesce(defect_nine_grid, ""))
+      by dmc_code
+    | project
+        dmc_code,
+        status_agg = strcat_array(status_list, " | "),
+        defect_report_time_agg = strcat_array(defect_report_time_list, " | "),
+        defect_code_agg = strcat_array(defect_code_list, " | "),
+        defect_surface_agg = strcat_array(defect_surface_list, " | "),
+        defect_nine_grid_agg = strcat_array(defect_nine_grid_list, " | ")
+}
+
+// traceability_milling_defect_agg_v1：8PA1 Milling 缺陷聚合表。
+// 它把同一 dmc_code 的 Milling 缺陷和工艺字段汇总成报表友好的聚合结果。
+.create-merge table traceability_milling_defect_agg_v1 (
+    dmc_code:string,
+    status_agg:string,
+    defect_code_agg:string,
+    defect_report_time_agg:string,
+    entry_time_agg:string,
+    milling_endtime_agg:string,
+    priming_code01_agg:string,
+    priming_code02_agg:string,
+    priming_code03_agg:string,
+    process_heat_temp_agg:string
+)
+
+// fn_traceability_milling_defect_agg_materialize_v1：8PA1 Milling 缺陷聚合函数。
+// 它读取 defect_plc_report_equivalent_v2，并按 dmc_code 聚合 Milling 相关缺陷与工艺字段。
+.create-or-alter function with (folder = "traceability/materialize", docstring = "8PA1 Milling defect aggregation aligned to old Grafana SQL") fn_traceability_milling_defect_agg_materialize_v1() {
+    defect_plc_report_equivalent_v2
+    | where isnotempty(dmc_code)
+    | where toupper(trim(@" ", tostring(factory))) == "8PA1_MILLING"
+    | extend sort_time = coalesce(defect_report_time, effective_source_time, source_time, adx_ingest_time)
+    | order by dmc_code asc, sort_time asc
+    | summarize
+        status_list = make_list(coalesce(status, "")),
+        defect_code_list = make_list(coalesce(defect_code, "")),
+        defect_report_time_list = make_list(iff(isnull(defect_report_time), "", format_datetime(defect_report_time, "yyyy-MM-dd HH:mm:ss"))),
+        entry_time_list = make_list(coalesce(tostring(entry_time), "")),
+        milling_endtime_list = make_list(coalesce(tostring(milling_endtime), "")),
+        priming_code01_list = make_list(coalesce(priming_code01, "")),
+        priming_code02_list = make_list(coalesce(priming_code02, "")),
+        priming_code03_list = make_list(coalesce(priming_code03, "")),
+        process_heat_temp_list = make_list(coalesce(tostring(process_heat_temp), ""))
+      by dmc_code
+    | project
+        dmc_code,
+        status_agg = strcat_array(status_list, " | "),
+        defect_code_agg = strcat_array(defect_code_list, " | "),
+        defect_report_time_agg = strcat_array(defect_report_time_list, " | "),
+        entry_time_agg = strcat_array(entry_time_list, " | "),
+        milling_endtime_agg = strcat_array(milling_endtime_list, " | "),
+        priming_code01_agg = strcat_array(priming_code01_list, " | "),
+        priming_code02_agg = strcat_array(priming_code02_list, " | "),
+        priming_code03_agg = strcat_array(priming_code03_list, " | "),
+        process_heat_temp_agg = strcat_array(process_heat_temp_list, " | ")
+}
+
+// fn_traceability_dashboard_equivalent_v1：面向 Grafana/查询页面的追溯查询封装函数。
+// 它把 traceability_wide_v2、Final 聚合表、Milling 聚合表拼起来，按 printId/dmc_code 提供一站式查询结果。
+.create-or-alter function with (folder = "traceability/dashboard", docstring = "Grafana-like traceability view over persisted wide snapshot and persisted defect aggregations") fn_traceability_dashboard_equivalent_v1(p_printId:string) {
+    traceability_wide_v2
+    | join kind = leftouter (traceability_final_defect_agg_v1) on dmc_code
+    | join kind = leftouter (traceability_milling_defect_agg_v1) on dmc_code
+    | where isempty(trim(@" ", p_printId)) or dmc_code == p_printId
+}
+
+// Run manually for initial load or periodic refresh. Do not place update policy on these grouped
+// current-state tables, otherwise repeated ingests will append duplicate snapshots.
+//
+// .set-or-replace traceability_wide_v2 <| fn_traceability_wide_v2_materialize_v1()
+// .set-or-replace traceability_final_defect_agg_v1 <| fn_traceability_final_defect_agg_materialize_v1()
+// .set-or-replace traceability_milling_defect_agg_v1 <| fn_traceability_milling_defect_agg_materialize_v1()

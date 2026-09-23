@@ -1,0 +1,362 @@
+[
+  {
+    "name": "ADX_CLUSTER_URL",
+    "value": "<adx-cluster-url>",
+    "slotSetting": false
+  },
+  {
+    "name": "ADX_DATABASE",
+    "value": "<adx-database>",
+    "slotSetting": false
+  },
+  {
+    "name": "ADX_TOKEN_SCOPE",
+    "value": "<adx-token-scope>",
+    "slotSetting": false
+  },
+  {
+    "name": "APPINSIGHTS_INSTRUMENTATIONKEY",
+    "value": "<appinsights-instrumentation-key>",
+    "slotSetting": true
+  },
+  {
+    "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+    "value": "<appinsights-connection-string>",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureFunctionsJobHost__functionTimeout",
+    "value": "04:30:00",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_chemical_traceability_5m.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_glass_master_10m.Disabled",
+    "value": "true",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_print_adx_export_1d.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_print_snowflake_loader_blob.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_production_output_10m.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_production_rollup_2h.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_silk_screen_status_eventhub.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobs.function_traceability_defect_10m.Disabled",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "AzureWebJobsStorage",
+    "value": "<azure-webjobs-storage-connection-string>",
+    "slotSetting": false
+  },
+  {
+    "name": "CHEMICAL_TRACEABILITY_API_BATCH_SIZE",
+    "value": "50",
+    "slotSetting": false
+  },
+  {
+    "name": "CHEMICAL_TRACEABILITY_SCHEDULE",
+    "value": "0 */5 * * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "CHEMICAL_TRACEABILITY_WATERMARK_BLOB_NAME",
+    "value": "chemical-traceability-global.json",
+    "slotSetting": false
+  },
+  {
+    "name": "EXPORT_PIPELINE_NAME",
+    "value": "print_snapshot_std",
+    "slotSetting": false
+  },
+  {
+    "name": "FUNCTIONS_EXTENSION_VERSION",
+    "value": "~4",
+    "slotSetting": false
+  },
+  {
+    "name": "FUNCTIONS_WORKER_RUNTIME",
+    "value": "python",
+    "slotSetting": false
+  },
+  {
+    "name": "GLASS_MASTER_DRY_RUN",
+    "value": "true",
+    "slotSetting": false
+  },
+  {
+    "name": "GLASS_MASTER_INITIAL_WATERMARK",
+    "value": "<optional-initial-watermark>",
+    "slotSetting": false
+  },
+  {
+    "name": "GLASS_MASTER_OVERLAP_MINUTES",
+    "value": "120",
+    "slotSetting": false
+  },
+  {
+    "name": "GLASS_MASTER_SCHEDULE",
+    "value": "0 */10 * * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "GLASS_MASTER_WATERMARK_BLOB_NAME",
+    "value": "glass-master-global.json",
+    "slotSetting": false
+  },
+  {
+    "name": "HTTP_PROXY",
+    "value": "<http-proxy-or-empty>",
+    "slotSetting": false
+  },
+  {
+    "name": "HTTPS_PROXY",
+    "value": "<https-proxy-or-empty>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_ACTIVE_ENV",
+    "value": "<uat-or-prod>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_PROD_APP_ID",
+    "value": "<app-id>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_PROD_APP_SECRET",
+    "value": "<app-secret>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_PROD_BASE_URL",
+    "value": "<base-url>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_TENANT_ID",
+    "value": "<tenant-id>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_UAT_APP_ID",
+    "value": "<app-id>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_UAT_APP_SECRET",
+    "value": "<app-secret>",
+    "slotSetting": false
+  },
+  {
+    "name": "INTEGRATION_UAT_BASE_URL",
+    "value": "<base-url>",
+    "slotSetting": false
+  },
+  {
+    "name": "NO_PROXY",
+    "value": "<no-proxy-or-empty>",
+    "slotSetting": false
+  },
+  {
+    "name": "PRINT_EXPORT_SCHEDULE",
+    "value": "0 0 1 * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_FORWARD_TARGET",
+    "value": "tellus_uat",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_INITIAL_WATERMARK",
+    "value": "<optional-initial-watermark>",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_LOOKBACK_HOURS",
+    "value": "24",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_OVERLAP_MINUTES",
+    "value": "60",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_SCHEDULE",
+    "value": "0 */10 * * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_OUTPUT_WATERMARK_BLOB_NAME",
+    "value": "prod-output-global.json",
+    "slotSetting": false
+  },
+  {
+    "name": "PRODUCTION_ROLLUP_SCHEDULE",
+    "value": "30 0 */2 * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "SCM_DO_BUILD_DURING_DEPLOYMENT",
+    "value": "false",
+    "slotSetting": false
+  },
+  {
+    "name": "SILK_SCREEN_ALLOWED_TOPICS",
+    "value": "SGH/WS1/NMF180/2CW6/PRINT1/SILK_SCREEN_STATUS,SGH/WS1/NMF180/2CW6/PRINT2,SGH/WS1/NMF180/2CW6/PRINT3,SGH/WS1/MF180/2CW2/PRINT1,SGH/WS1/MF180/2CW2/PRINT2,SGH/WS1/MF180/2CW2/PRINT3/SILK_SCREEN_STATUS",
+    "slotSetting": false
+  },
+  {
+    "name": "SILK_SCREEN_EVENTHUB_CONNECTION",
+    "value": "<eventhub-connection-string>",
+    "slotSetting": false
+  },
+  {
+    "name": "SILK_SCREEN_EVENTHUB_NAME",
+    "value": "<eventhub-name>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_ACCOUNT",
+    "value": "<snowflake-account>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_DATABASE",
+    "value": "<snowflake-database>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_EXPORT_CONTAINER",
+    "value": "<snowflake-export-container>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_EXPORT_PREFIX",
+    "value": "<snowflake-export-prefix>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+    "value": "<snowflake-private-key-passphrase>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_PRIVATE_KEY_PEM",
+    "value": "-----BEGIN ENCRYPTED PRIVATE KEY-----\\n<customer-private-key-pem>\\n-----END ENCRYPTED PRIVATE KEY-----",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_ROLE",
+    "value": "<snowflake-role>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_SCHEMA",
+    "value": "<snowflake-schema>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_TABLE",
+    "value": "<snowflake-table>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_USER",
+    "value": "<snowflake-user>",
+    "slotSetting": false
+  },
+  {
+    "name": "SNOWFLAKE_WAREHOUSE",
+    "value": "<snowflake-warehouse>",
+    "slotSetting": false
+  },
+  {
+    "name": "STATE_STORAGE_ACCOUNT_URL",
+    "value": "<state-storage-account-url>",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_API_BATCH_SIZE",
+    "value": "500",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_API_MAX_GROUPS_PER_BATCH",
+    "value": "100",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_API_TIMEOUT",
+    "value": "120",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_FORWARD_TARGET",
+    "value": "baiteda_uat",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_INITIAL_WATERMARK",
+    "value": "<optional-initial-watermark>",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_OVERLAP_MINUTES",
+    "value": "60",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_SCHEDULE",
+    "value": "0 */10 * * * *",
+    "slotSetting": false
+  },
+  {
+    "name": "TRACEABILITY_DEFECT_WATERMARK_BLOB_NAME",
+    "value": "defect-global.json",
+    "slotSetting": false
+  },
+  {
+    "name": "WATERMARK_CONTAINER_NAME",
+    "value": "adx-watermark",
+    "slotSetting": false
+  },
+  {
+    "name": "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+    "value": "<connection-string>",
+    "slotSetting": false
+  },
+  {
+    "name": "WEBSITE_CONTENTSHARE",
+    "value": "sekcn-iotdb-func02-prd-n38469",
+    "slotSetting": false
+  }
+]

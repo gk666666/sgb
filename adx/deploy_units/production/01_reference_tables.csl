@@ -1,0 +1,114 @@
+// 产量 reference table 脚本。
+//
+// 这里最核心的是 dim_prod_topic_registry：
+// - 它定义每个 topic 属于哪类业务；
+// - 决定该 topic 是否参与 minute / hour / day / month 重建；
+// - 决定该 topic 是否进入 Tellus 发送范围。
+//
+// 当前配置已按 Java 真名单拆成三类：
+// 1) DataCycleJob 第一/四车间小时链；
+// 2) DataCycleJob 第二车间小时 + 日 + 月链；
+// 3) SendPostApi 的分钟 + Tellus 白名单。
+//
+// 这张表使用 .set-or-replace，
+// 目的是避免多次整份执行后把 registry 行重复追加进去。
+//
+// 对象说明：
+// - table dim_prod_topic_registry：产量 topic 注册表，决定哪些 topic 参与分钟/小时/日/月重建，以及是否允许 Tellus 发送。
+
+// dim_prod_topic_registry：产量 topic 注册表，定义每个 topic 的业务归属和启用范围。
+// 后续 minute/hour/day/month 重建函数，以及 Tellus 候选函数，都会先查这张表决定是否纳入处理。
+.create-merge table dim_prod_topic_registry (
+    topic: string,
+    domain_family: string,
+    workcenter: string,
+    line_name: string,
+    metric_type: string,
+    aggregation_rule: string,
+    reset_rule: string,
+    recipe_scope: string,
+    build_minute: bool,
+    build_hour: bool,
+    build_day: bool,
+    build_month: bool,
+    tellus_sync: bool,
+    is_enabled: bool
+)
+
+// 初始化 dim_prod_topic_registry：把当前正式启用的产量/配方 topic 清单整表覆盖写入注册表。
+// 后续 minute/hour/day/month 重建和 Tellus 白名单判断都以这里的数据为准。
+.set-or-replace dim_prod_topic_registry <|
+datatable(
+    topic:string,
+    domain_family:string,
+    workcenter:string,
+    line_name:string,
+    metric_type:string,
+    aggregation_rule:string,
+    reset_rule:string,
+    recipe_scope:string,
+    build_minute:bool,
+    build_hour:bool,
+    build_day:bool,
+    build_month:bool,
+    tellus_sync:bool,
+    is_enabled:bool
+)
+[
+    // Java DataCycleJob 第一/四车间 topic：主链是小时重建。
+    "SGH/2CW6/LOAD_1/Glas/Load/Total_Qty", "output_counter", "2CW6", "2CW6", "load_total_qty", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/LOAD_2/Glas/Load/Total_Qty", "output_counter", "2CW6", "2CW6", "load_total_qty", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/CBG_1/Glas/Load", "output_counter", "2CW6", "2CW6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/CBG_2/Glas/Load", "output_counter", "2CW6", "2CW6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/CBG_1/Glas/Unload", "output_counter", "2CW6", "2CW6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/CBG_2/Glas/Unload", "output_counter", "2CW6", "2CW6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/WM_1/Glas/Load/Total", "output_counter", "2CW6", "2CW6", "load_total", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/WM_2/Glas/Load/Total", "output_counter", "2CW6", "2CW6", "load_total", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/SCPRNT_1/Glas/Output", "output_counter", "2CW6", "2CW6", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/SCPRNT_2/Glas/Output", "output_counter", "2CW6", "2CW6", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/SCPRNT_3/Glas/Output", "output_counter", "2CW6", "2CW6", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/WM_1/Glas/Load/Unit", "output_counter", "2CW6", "2CW6", "load_unit", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/WM_2/Glas/Load/Unit", "output_counter", "2CW6", "2CW6", "load_unit", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/8PAB/PG/LOAD/Qty/Input", "output_counter", "8PAB", "8PAB", "input", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/8PAC/PG/LOAD/Qty/Input", "output_counter", "8PAC", "8PAC", "input", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/8PAA/PG/LOAD/Qty/Input", "output_counter", "8PAA", "8PAA", "input", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/8PAD/PG/LOAD/Qty/Input", "output_counter", "8PAD", "8PAD", "input", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/8PAF/PG/LOAD/Qty/Input", "output_counter", "8PAF", "8PAF", "input", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/2CW6/PPL/Conv/Load", "output_counter", "2CW6", "2CW6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/3FW6/FUR/Glas/Load", "output_counter", "3FW6", "3FW6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/4AW6/GS/Glas/Load", "output_counter", "4AW6", "4AW6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+    "SGH/5FN6/FIN/Glas/Load", "output_counter", "5FN6", "5FN6", "load", "counter_delta_plus_one", "counter_reset_to_zero", "", false, true, false, false, false, true,
+
+    // Java DataCycleJob 第二车间 topic：小时 + 日 + 月重建。
+    "SGH/3BKT/Glas_Qty/Load", "output_counter", "3BKT", "3BKT", "load", "counter_delta_plus_one", "counter_reset_to_zero", "3BKT", false, true, true, true, false, true,
+    "SGH/3BKT/Glas_Qty/Unload", "output_counter", "3BKT", "3BKT", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "3BKT", false, true, true, true, false, true,
+    "SGH/2CL1/Glas_Qty/Input", "output_counter", "2CL1", "2CL1", "input", "counter_delta_plus_one", "counter_reset_to_zero", "2CL1", false, true, true, true, false, true,
+    "SGH/2CL1/SCPRNT/Clean_count", "output_counter", "2CL1", "2CL1", "clean_count", "counter_delta_plus_one", "counter_reset_to_zero", "2CL1", false, true, true, true, false, true,
+    "SGH/3BT2/Fur/Qty/Input", "output_counter", "3BT2", "3BT2", "input", "counter_delta_plus_one", "counter_reset_to_zero", "3BT2", false, true, true, true, false, true,
+    "SGH/3BT2/Fur/Qty/Output", "output_counter", "3BT2", "3BT2", "output", "counter_delta_plus_one", "counter_reset_to_zero", "3BT2", false, true, true, true, false, true,
+
+    // Java SendPostApi.TOPIC_LIST：分钟重建 + Tellus 发送。
+    // 其中与 DataCycleJob 重叠的 topic 同时保留 build_hour=true。
+    "SGH/8PAB/PG/LOAD/Qty/Output", "output_counter", "8PAB", "8PAB", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/8PAC/PG/LOAD/Qty/Output", "output_counter", "8PAC", "8PAC", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/8PAA/PG/LOAD/Qty/Output", "output_counter", "8PAA", "8PAA", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/8PAD/PG/LOAD/Qty/Output", "output_counter", "8PAD", "8PAD", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/8PAF/PG/LOAD/Qty/Output", "output_counter", "8PAF", "8PAF", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/2CW6/PPL/Conv/Unload", "output_counter", "2CW6", "2CW6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/3FW6/FUR/Glas/Unload", "output_counter", "3FW6", "3FW6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/4AW6/GS/Glas/Unload", "output_counter", "4AW6", "4AW6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/5FN6/FIN/Glas/Unload", "output_counter", "5FN6", "5FN6", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/3FW2/FUR/Qty/Unload", "output_counter", "3FW2", "3FW2", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/5FN1/FIN/Glas/Unload", "output_counter", "5FN1", "5FN1", "unload", "counter_delta_plus_one", "counter_reset_to_zero", "", true, true, false, false, true, true,
+    "SGH/4AL1/Fur/Qty/Output", "output_counter", "4AL1", "4AL1", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/4AL2/Auto_ASSY/Qty/Output", "output_counter", "4AL2", "4AL2", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/5FL2/Vertical_Inspect/QTY/Output", "output_counter", "5FL2", "5FL2", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/8PA1_MB/Total_Output", "output_counter", "8PA1_MB", "8PA1_MB", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/8PA2_SL/New_Door/Qty/Ouput", "output_counter", "8PA2_SL", "8PA2_SL", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/8PU1/Output", "output_counter", "8PU1", "8PU1", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+    "SGH/5FL2/LineB/QTY/Output", "output_counter", "5FL2", "5FL2", "output", "counter_delta_plus_one", "counter_reset_to_zero", "", true, false, false, false, true, true,
+
+    // Recipe change topic。
+    "SGH/3BKT/Recipe_Number", "recipe_change", "3BKT", "3BKT", "recipe", "change_event", "none", "3BKT", false, false, false, false, false, true,
+    "SGH/AUTOCLAVE_6/Recipe_Num", "recipe_change", "AUTOCLAVE_6", "AUTOCLAVE_6", "recipe", "change_event", "none", "AUTOCLAVE_6", false, false, false, false, false, true
+]
